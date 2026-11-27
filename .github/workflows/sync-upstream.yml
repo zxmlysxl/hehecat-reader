@@ -1,0 +1,163 @@
+name: sync-upstream
+
+# 同步上游 hehecat/reader，同时保留本 fork 的定制文件。
+#
+# 策略（不依赖 merge 冲突解决，行为完全可预期）：
+#   1. 以 upstream/main 的整棵树为基底
+#   2. 用 .github/upstream-sync/protected-files.txt 列出的文件覆盖回本 fork 的版本
+#   3. 校验每个受保护文件的 blob hash 与同步前一致（不一致就中止，不推送）
+#   4. 推到 sync/upstream-* 分支并开 PR；auto_merge=true 时自动合并
+#
+# 新增/删除受保护文件：编辑 .github/upstream-sync/protected-files.txt（每行一个路径）。
+
+on:
+  schedule:
+    # 每周一 04:00 (Asia/Shanghai) = 周日 20:00 UTC
+    - cron: "0 20 * * 0"
+  workflow_dispatch:
+    inputs:
+      auto_merge:
+        description: "开 PR 后是否自动合并（需仓库开启 auto-merge）"
+        type: boolean
+        default: false
+      dry_run:
+        description: "只做演练，不推送不开 PR"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 拉取上游
+        run: |
+          git remote add upstream https://github.com/hehecat/reader.git
+          git fetch --no-tags upstream main
+          echo "upstream/main = $(git rev-parse upstream/main)"
+
+      - name: 收集受保护文件列表
+        run: |
+          LIST=.github/upstream-sync/protected-files.txt
+          test -f "$LIST" || { echo "缺少受保护文件清单"; exit 1; }
+          { cat "$LIST"; echo "$LIST"; } | sed '/^[[:space:]]*$/d' | sort -u > /tmp/protected.txt
+          echo "受保护文件数: $(wc -l < /tmp/protected.txt)"
+
+      - name: 记录同步前的 blob hash
+        run: |
+          : > /tmp/before.sha
+          while read -r f; do
+            [ -n "$f" ] || continue
+            h=$(git rev-parse "HEAD:$f" 2>/dev/null || echo MISSING)
+            printf "%s %s\n" "$f" "$h" >> /tmp/before.sha
+          done < /tmp/protected.txt
+          echo "已记录 $(wc -l < /tmp/before.sha) 个文件"
+
+      - name: 以上游为基底重建工作树，再覆盖回本 fork 的受保护文件
+        run: |
+          set -euo pipefail
+          git read-tree upstream/main
+          git checkout-index -a -f
+          git clean -fdq
+          while read -r f; do
+            [ -n "$f" ] || continue
+            git checkout HEAD -- "$f"
+          done < /tmp/protected.txt
+          git add -A
+
+      - name: 校验受保护文件未被上游覆盖
+        run: |
+          set -euo pipefail
+          fail=0
+          while read -r f; do
+            [ -n "$f" ] || continue
+            want=$(awk -v p="$f" '$1==p {print $2}' /tmp/before.sha | head -1)
+            got=$(git hash-object "$f" 2>/dev/null || echo MISSING)
+            if [ "$want" != "$got" ]; then
+              echo "::error file=$f 受保护文件被改动（期望 $want，实际 $got）"
+              fail=1
+            fi
+          done < /tmp/protected.txt
+          if [ "$fail" != "0" ]; then
+            echo 受保护文件校验失败，中止推送
+            exit 1
+          fi
+          echo 受保护文件校验通过
+
+      - name: 确认定制功能仍在
+        run: |
+          set -euo pipefail
+          check() {
+            if ! grep -rq "$2" "$1"; then
+              echo "::error file=$1 缺少定制标记 $2"
+              exit 1
+            fi
+          }
+          check backend/src/api/search.rs "persist_search_candidates"
+          check backend/src/api/sources.rs "check_book_sources_sse"
+          check backend/src/api/sources.rs "rewrite_yiove_collection_url"
+          check frontend-v2/src/lib/keepScreenAwake.ts "requestWakeLock"
+          check frontend-v2/src/features/reader/ReaderPage.tsx "KeepScreenAwake"
+          echo 定制功能抽查通过
+
+      - name: 生成提交
+        id: commit
+        run: |
+          set -euo pipefail
+          if git diff --cached --quiet; then
+            echo "no_changes=true" >> "$GITHUB_OUTPUT"
+            echo 无变化，跳过
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "chore(sync): 同步上游 hehecat/reader 并保留本 fork 定制"
+          echo "no_changes=false" >> "$GITHUB_OUTPUT"
+
+      - name: 推送分支
+        if: steps.commit.outputs.no_changes == 'false' && inputs.dry_run != true
+        run: |
+          BRANCH="sync/upstream-$(date +%Y%m%d-%H%M%S)"
+          echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+          git push origin "HEAD:refs/heads/$BRANCH"
+
+      - name: 打开 PR
+        if: steps.commit.outputs.no_changes == 'false' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## 上游同步"
+            echo ""
+            echo "本 PR 以 upstream/main 为基底重建，再把"
+            echo ".github/upstream-sync/protected-files.txt 中列出的文件覆盖回本 fork 的版本。"
+            echo ""
+            echo "- 受保护文件：blob hash 已逐个校验，与同步前一致"
+            echo "- 关键定制功能：已抽查存在"
+            echo "- 未受保护的文件：全部采用上游最新实现"
+            echo ""
+            echo "若上游改动与受保护文件产生语义冲突（而非文件级冲突），请人工复核本 PR。"
+          } > /tmp/pr-body.md
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "chore(sync): 同步上游 hehecat/reader" \
+            --body-file /tmp/pr-body.md
+
+      - name: 自动合并
+        if: steps.commit.outputs.no_changes == 'false' && inputs.dry_run != true && inputs.auto_merge == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr merge --squash --auto "$BRANCH" || echo "::warning 自动合并失败，可在 PR 页面手动合并"
