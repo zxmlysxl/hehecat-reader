@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   RefreshCw,
   Trash2,
@@ -39,9 +39,11 @@ export function AutoImportSection() {
   const [invalidList, setInvalidList] = useState<InvalidBookSource[]>([]);
   const [loading, setLoading] = useState(true);
   const [previewing, setPreviewing] = useState(false);
+  const [listUrlDraft, setListUrlDraft] = useState("");
+  const listUrlTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const refresh = async () => {
-    setLoading(true);
+  // 仅初次挂载全量拉取；之后用 refreshSilent（不切 loading，不卸载整块）
+  const refreshSilent = async () => {
     try {
       const pv = await autoImportApi.preview();
       if (pv) {
@@ -57,6 +59,7 @@ export function AutoImportSection() {
           lastResult: pv.lastResult,
           lastImportedCount: pv.lastImportedCount,
         });
+        setListUrlDraft(pv.listUrl);
         setPreview({
           listUrl: pv.listUrl,
           lastId: pv.lastId,
@@ -68,16 +71,21 @@ export function AutoImportSection() {
       setInvalidList(inv ?? []);
     } catch {
       // silent
-    } finally {
-      setLoading(false);
     }
   };
 
   useEffect(() => {
-    refresh();
+    (async () => {
+      await refreshSilent();
+      setLoading(false);
+    })();
+    return () => {
+      if (listUrlTimer.current) clearTimeout(listUrlTimer.current);
+    };
   }, []);
 
-  const handleSave = async (fields: {
+  // 保存后端字段：乐观更新本地 + 后台静默同步，不切 loading、不卸载区块
+  const save = async (fields: {
     enabled?: boolean;
     scheduleType?: "daily" | "weekly";
     dailyTime?: string;
@@ -85,13 +93,25 @@ export function AutoImportSection() {
     autoDeleteInvalid?: boolean;
     listUrl?: string;
   }) => {
+    // 乐观更新本地，UI 立即反映
+    setConfig((c) => (c ? { ...c, ...fields } : c));
+    setPreview((p) => (p ? { ...p, ...(fields.listUrl !== undefined ? { listUrl: fields.listUrl } : null) } : p));
     try {
       await autoImportApi.saveConfig(fields);
-      notify.success("已保存");
-      await refresh();
     } catch (e) {
       notify.error(e instanceof Error ? e.message : "保存失败");
+      // 失败则回滚：重新拉取真实状态
+      await refreshSilent();
     }
+  };
+
+  // 列表页地址：输入时只改本地草稿，防抖 600ms 后保存，避免每敲一键就 POST
+  const onListUrlChange = (v: string) => {
+    setListUrlDraft(v);
+    if (listUrlTimer.current) clearTimeout(listUrlTimer.current);
+    listUrlTimer.current = setTimeout(() => {
+      save({ listUrl: v });
+    }, 600);
   };
 
   const handleRun = async () => {
@@ -102,7 +122,8 @@ export function AutoImportSection() {
         `导入 ${res.importedEntries} 个合集 / ${res.importedSources} 个书源` +
           (res.deletedInvalid > 0 ? `，删除 ${res.deletedInvalid} 个失效源` : ""),
       );
-      await refresh();
+      // 执行后只更新预览/统计，不切 loading
+      await refreshSilent();
     } catch (e) {
       notify.error(e instanceof Error ? e.message : "执行失败");
     } finally {
@@ -114,7 +135,7 @@ export function AutoImportSection() {
     try {
       const res = await sourcesApi.deleteInvalid();
       notify.success(`已删除 ${res.deleted} 个失效书源`);
-      await refresh();
+      await refreshSilent();
     } catch (e) {
       notify.error(e instanceof Error ? e.message : "删除失效源失败");
     }
@@ -136,7 +157,7 @@ export function AutoImportSection() {
         {config && (
           <Switch
             checked={config.enabled}
-            onChange={(v) => handleSave({ enabled: v })}
+            onChange={(v) => save({ enabled: v })}
           />
         )}
       </div>
@@ -152,8 +173,18 @@ export function AutoImportSection() {
             <div className="flex items-center gap-2">
               <span className="shrink-0 text-xs text-muted">列表页地址</span>
               <Input
-                value={config.listUrl}
-                onChange={(e) => handleSave({ listUrl: e.target.value })}
+                value={listUrlDraft}
+                onChange={(e) => onListUrlChange(e.target.value)}
+                onBlur={() => {
+                  if (listUrlTimer.current) {
+                    clearTimeout(listUrlTimer.current);
+                    listUrlTimer.current = null;
+                  }
+                  if (listUrlDraft !== config.listUrl) {
+                    save({ listUrl: listUrlDraft });
+                  }
+                }}
+                placeholder="https://…/index.html"
                 className="w-full"
               />
             </div>
@@ -169,7 +200,7 @@ export function AutoImportSection() {
                     <input
                       type="radio"
                       checked={config.scheduleType === "daily"}
-                      onChange={() => handleSave({ scheduleType: "daily" })}
+                      onChange={() => save({ scheduleType: "daily" })}
                     />
                     每天
                   </label>
@@ -177,7 +208,7 @@ export function AutoImportSection() {
                     <input
                       type="radio"
                       checked={config.scheduleType === "weekly"}
-                      onChange={() => handleSave({ scheduleType: "weekly" })}
+                      onChange={() => save({ scheduleType: "weekly" })}
                     />
                     每周
                   </label>
@@ -185,7 +216,7 @@ export function AutoImportSection() {
                 <input
                   type="time"
                   value={config.dailyTime}
-                  onChange={(e) => handleSave({ dailyTime: e.target.value })}
+                  onChange={(e) => save({ dailyTime: e.target.value })}
                   className="rounded-md border border-line bg-transparent px-2 py-1 text-xs"
                 />
                 {config.scheduleType === "weekly" && (
@@ -204,7 +235,7 @@ export function AutoImportSection() {
                           const days = config.weeklyDays.includes(i)
                             ? config.weeklyDays.filter((x) => x !== i)
                             : [...config.weeklyDays, i];
-                          handleSave({ weeklyDays: days });
+                          save({ weeklyDays: days });
                         }}
                       >
                         {d}
@@ -221,7 +252,7 @@ export function AutoImportSection() {
             <div className="flex items-center gap-3">
               <Switch
                 checked={config.autoDeleteInvalid}
-                onChange={(v) => handleSave({ autoDeleteInvalid: v })}
+                onChange={(v) => save({ autoDeleteInvalid: v })}
               />
               <span className="text-xs">自动检测并删除失效源</span>
               <span className="text-xs text-muted">每次自动导入后执行</span>
