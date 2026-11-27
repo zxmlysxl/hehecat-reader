@@ -304,16 +304,16 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
             post(sources::delete_invalid_book_sources),
         )
         .route(
-            "/reader3/getAutoImportConfig",
-            get(auto_import::get_auto_import_config).post(auto_import::get_auto_import_config),
+            "/reader3/autoImportPreview",
+            get(auto_import::auto_import_preview).post(auto_import::auto_import_preview),
         )
         .route(
-            "/reader3/setAutoImportConfig",
-            post(auto_import::set_auto_import_config),
+            "/reader3/autoImportConfig",
+            post(auto_import::auto_import_save_config),
         )
         .route(
-            "/reader3/runAutoImportNow",
-            post(auto_import::run_auto_import_now),
+            "/reader3/autoImportRun",
+            post(auto_import::auto_import_run),
         )
         .route(
             "/reader3/getAvailableBookSource",

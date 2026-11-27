@@ -4,7 +4,7 @@
 //!   手工逐个导入太慢。本模块按「增量 id」策略自动跟进。
 //! - 增量语义：列表页解析出条目 id（数字递增），只处理 id > last_id 的条目；
 //!   处理完把 last_id 更新为最大 id —— 即"上次导入 1347，下次从 1347 之后开始"。
-//! - 配置按命名空间存 user_config(ns='autoImport')，管理员可开关与设定间隔。
+//! - 配置按命名空间存 user_config(ns='autoImport')，管理员可开关与设定调度。
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::storage::Storage;
+use futures::StreamExt; // for FuturesUnordered::next()
 
 /// 用户配置键（user_config.ns）
 pub const CFG_KEY: &str = "autoImport";
@@ -35,14 +36,31 @@ const DETAIL_JSON_RE: &str = r#"https?://[\w./?&=%-]*shuyuans/json(?:/id)?/\d+\.
 /// 列表页条目链接：/yuedu/shuyuans/content/id/1349.html
 const LIST_ID_RE: &str = r#"/content/id/(\d+)\.html"#;
 
+/// 调度类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ScheduleType {
+    /// 每天指定时间
+    #[default]
+    Daily,
+    /// 每周指定星期
+    Weekly,
+}
+
 /// 自动导入配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AutoImportConfig {
     /// 总开关
     pub enabled: bool,
-    /// 两次执行之间的最小间隔（分钟）
-    pub interval_minutes: i64,
+    /// 调度类型（daily / weekly）
+    pub schedule_type: ScheduleType,
+    /// 每天指定时间 "HH:MM"（schedule_type=daily 时用）
+    pub daily_time: String,
+    /// 每周指定星期 0=周一...6=周日（schedule_type=weekly 时用）
+    pub weekly_days: Vec<u8>,
+    /// 是否自动检测并删除失效源
+    pub auto_delete_invalid: bool,
     /// 合集列表页地址
     pub list_url: String,
     /// 上次处理到的最大条目 id（下次只处理比它大的）
@@ -59,7 +77,10 @@ impl Default for AutoImportConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            interval_minutes: 360,
+            schedule_type: ScheduleType::Daily,
+            daily_time: "03:00".to_string(),
+            weekly_days: vec![0],
+            auto_delete_invalid: false,
             list_url: DEFAULT_LIST_URL.to_string(),
             last_id: 0,
             last_run_at: 0,
@@ -83,6 +104,8 @@ pub struct RunResult {
     pub last_id: i64,
     /// 每个条目的处理明细
     pub details: Vec<String>,
+    /// 本次删除的失效源数量（auto_delete_invalid 开启时）
+    pub deleted_invalid: usize,
 }
 
 /// 读取命名空间的自动导入配置
@@ -150,7 +173,7 @@ async fn scan_entry_ids(list_url: &str) -> Result<Vec<i64>> {
     Ok(ids)
 }
 
-/// 从合集详情页提取 json 订阅地址
+/// 从合集详情页提取 json 订阅地址（内部用）
 async fn resolve_json_url(detail_url: &str) -> Result<String> {
     let headers: HashMap<String, String> = HashMap::new();
     let resp =
@@ -169,6 +192,67 @@ async fn resolve_json_url(detail_url: &str) -> Result<String> {
         Some(url) => Ok(url),
         None => Err(anyhow::anyhow!("详情页未找到 json 地址")),
     }
+}
+
+/// 公开：扫描待导入条目（只读不写，供预览）
+/// 同步壳仅为占位；调用方应使用异步版 scan_pending_async。
+pub fn scan_pending(_cfg: &AutoImportConfig) -> Result<Vec<i64>> {
+    anyhow::bail!("请使用异步版 scan_pending_async")
+}
+
+/// 公开：扫描待导入条目（异步版）
+pub async fn scan_pending_async(cfg: &AutoImportConfig) -> Result<Vec<i64>> {
+    let ids = scan_entry_ids(&cfg.list_url).await?;
+    Ok(ids.into_iter().filter(|id| *id > cfg.last_id).collect())
+}
+
+/// 公开：从详情页解析 json 地址
+pub async fn resolve_json_url_public(detail_url: &str) -> Result<String> {
+    resolve_json_url(detail_url).await
+}
+
+/// 检测并删除失效源，返回删除数量
+async fn check_and_delete_invalid(
+    storage: &Storage,
+    ns: &str,
+) -> Result<usize> {
+    let sources: Vec<crate::model::BookSource> =
+        storage.get_book_sources(ns).await?.into_iter().filter(|s| s.enabled).collect();
+    let total = sources.len();
+    let concurrency: usize = std::env::var("READER_CHECK_SOURCES_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(32)
+        .clamp(1, 128);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut tasks = futures::stream::FuturesUnordered::new();
+    for source in sources.into_iter() {
+        let sem = semaphore.clone();
+        let nsx = ns.to_string();
+        tasks.push(Box::pin(async move {
+            let _permit = sem.acquire().await;
+            let (ok, _reason) =
+                crate::service::health::check_source(&nsx, &source).await;
+            (source, ok)
+        }));
+    }
+    let mut deleted = 0usize;
+    while let Some((source, ok)) = tasks.next().await {
+        if ok {
+            crate::service::health::clear_source_invalid(ns, &source.book_source_url);
+        } else {
+            crate::service::health::mark_source_invalid(ns, &source.book_source_url, "自动检测失效");
+        }
+    }
+    // 删除已标记失效的
+    let snapshot = crate::service::health::invalid_snapshot(ns);
+    for (url, _time, _err) in snapshot {
+        if storage.delete_book_source(ns, &url).await.is_ok() {
+            deleted += 1;
+            crate::service::health::clear_source_invalid(ns, &url);
+        }
+    }
+    Ok(deleted)
 }
 
 /// 执行一次自动导入
@@ -232,9 +316,23 @@ pub async fn run_once(storage: &Storage, ns: &str, cfg: &mut AutoImportConfig) -
         cfg.last_id = cfg.last_id.max(id);
     }
 
+    // 自动检测并删除失效源
+    let mut deleted_invalid = 0usize;
+    if cfg.auto_delete_invalid {
+        match check_and_delete_invalid(storage, ns).await {
+            Ok(n) => {
+                deleted_invalid = n;
+                details.push(format!("检测并删除 {n} 个失效源"));
+            }
+            Err(e) => {
+                details.push(format!("失效源检测失败: {e:#}"));
+            }
+        }
+    }
+
     cfg.last_run_at = chrono::Utc::now().timestamp_millis();
     cfg.last_imported_count = imported_sources as i64;
-    cfg.last_result = if imported_entries == 0 {
+    let import_summary = if imported_entries == 0 {
         if max_new == 0 {
             "无新增条目".to_string()
         } else {
@@ -242,6 +340,11 @@ pub async fn run_once(storage: &Storage, ns: &str, cfg: &mut AutoImportConfig) -
         }
     } else {
         format!("导入 {imported_entries} 个合集 / {imported_sources} 个书源")
+    };
+    cfg.last_result = if cfg.auto_delete_invalid && deleted_invalid > 0 {
+        format!("{import_summary}；删除 {deleted_invalid} 个失效源")
+    } else {
+        import_summary
     };
     let _ = save_config(storage, ns, cfg).await;
 
@@ -251,11 +354,12 @@ pub async fn run_once(storage: &Storage, ns: &str, cfg: &mut AutoImportConfig) -
         imported_sources,
         last_id: cfg.last_id,
         details,
+        deleted_invalid,
     })
 }
 
 /// 由列表页地址推导合集详情页地址
-fn derive_detail_url(list_url: &str, id: i64) -> String {
+pub fn derive_detail_url(list_url: &str, id: i64) -> String {
     let base = list_url.split('?').next().unwrap_or(list_url);
     let base = base.trim_end_matches('/');
     // .../yuedu/shuyuans/index.html → .../yuedu/shuyuans/content/id/<id>.html
@@ -266,6 +370,43 @@ fn derive_detail_url(list_url: &str, id: i64) -> String {
     }
 }
 
+/// 判断当前时刻是否应触发执行（基于配置的时间调度）
+/// now: 本地时间
+fn should_run_at(cfg: &AutoImportConfig, now: &chrono::DateTime<chrono::Local>) -> bool {
+    // 当前是否落在配置的执行时间窗口（10 分钟粒度）
+    let (h, m) = parse_hm(&cfg.daily_time);
+    let now_h = now.format("%H").to_string().parse::<u32>().unwrap_or(0);
+    let now_m = now.format("%M").to_string().parse::<u32>().unwrap_or(0);
+    // 不在窗口内 → 不触发
+    if now_h != h || now_m < m || now_m >= m + 10 {
+        return false;
+    }
+    // weekly 模式：检查今天星期是否在 weekly_days
+    if let ScheduleType::Weekly = cfg.schedule_type {
+        let weekday = now.format("%u").to_string().parse::<u8>().unwrap_or(0).saturating_sub(1); // 0=Mon..6=Sun
+        if !cfg.weekly_days.iter().any(|d| *d == weekday) {
+            return false;
+        }
+    }
+    // 检查今天是否已跑过（last_run_at 同一天 → 跳过）
+    if cfg.last_run_at > 0 {
+        let now_date = now.format("%Y-%m-%d").to_string();
+        let last_date: chrono::DateTime<chrono::Local> =
+            chrono::DateTime::from(chrono::TimeZone::timestamp_millis(&chrono::Local, cfg.last_run_at));
+        if last_date.format("%Y-%m-%d").to_string() == now_date {
+            return false;
+        }
+    }
+    true
+}
+
+fn parse_hm(s: &str) -> (u32, u32) {
+    let parts: Vec<&str> = s.split(':').collect();
+    let h = parts.get(0).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+    let m = parts.get(1).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+    (h, m)
+}
+
 /// 启动定时任务：每 10 分钟检查一次各命名空间的配置，到期则执行
 pub fn spawn_auto_import_job(storage: Storage) {
     tokio::spawn(async move {
@@ -273,28 +414,28 @@ pub fn spawn_auto_import_job(storage: Storage) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            let now = chrono::Local::now();
             let namespaces = storage.schedule_namespaces().await;
             for ns in namespaces {
                 let mut cfg = load_config(&storage, &ns).await;
                 if !cfg.enabled {
                     continue;
                 }
-                let interval_ms = cfg.interval_minutes.clamp(10, 60 * 24 * 7) * 60_000;
-                let now = chrono::Utc::now().timestamp_millis();
-                if cfg.last_run_at > 0 && now - cfg.last_run_at < interval_ms {
+                if !should_run_at(&cfg, &now) {
                     continue;
                 }
                 match run_once(&storage, &ns, &mut cfg).await {
                     Ok(r) => {
                         tracing::info!(
-                            "自动导入书源 [{}]: {}（扫描 {} 条）",
+                            "自动导入书源 [{}]: {}（扫描 {} 条，删除 {} 个失效源）",
                             ns,
                             r.last_id,
-                            r.scanned
+                            r.scanned,
+                            r.deleted_invalid
                         );
                     }
                     Err(e) => {
-                        cfg.last_run_at = now;
+                        cfg.last_run_at = chrono::Utc::now().timestamp_millis();
                         cfg.last_result = format!("失败: {e:#}");
                         let _ = save_config(&storage, &ns, &cfg).await;
                         tracing::warn!("自动导入书源 [{ns}] 失败: {e:#}");

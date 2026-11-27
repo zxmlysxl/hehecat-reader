@@ -73,7 +73,10 @@ export const usersApi = {
 
 export interface AutoImportConfig {
   enabled: boolean;
-  intervalMinutes: number;
+  scheduleType: 'daily' | 'weekly';
+  dailyTime: string;
+  weeklyDays: number[];
+  autoDeleteInvalid: boolean;
   listUrl: string;
   lastId: number;
   lastRunAt: number;
@@ -86,14 +89,35 @@ export interface AutoImportRunResult {
   importedEntries: number;
   importedSources: number;
   lastId: number;
+  deletedInvalid: number;
   details: string[];
 }
 
 export const autoImportApi = {
-  getConfig: () => apiGet<AutoImportConfig>("/reader3/getAutoImportConfig"),
-  setConfig: (body: { enabled?: boolean; intervalMinutes?: number; listUrl?: string }) =>
-    apiPost<AutoImportConfig>("/reader3/setAutoImportConfig", body),
-  runNow: () => apiPost<AutoImportRunResult>("/reader3/runAutoImportNow", {}),
+  preview: () => apiGet<{
+    listUrl: string;
+    lastId: number;
+    pendingCount: number;
+    preview: Array<{ id: number; detailUrl: string; jsonUrl: string | null; error?: string }>;
+    enabled: boolean;
+    scheduleType: 'daily' | 'weekly';
+    dailyTime: string;
+    weeklyDays: number[];
+    autoDeleteInvalid: boolean;
+    lastRunAt: number;
+    lastResult: string;
+    lastImportedCount: number;
+  }>("/reader3/autoImportPreview"),
+  saveConfig: (body: {
+    enabled?: boolean;
+    scheduleType?: 'daily' | 'weekly';
+    dailyTime?: string;
+    weeklyDays?: number[];
+    autoDeleteInvalid?: boolean;
+    listUrl?: string;
+  }) => apiPost<AutoImportConfig>("/reader3/autoImportConfig", body),
+  run: (forceFullScan = false) =>
+    apiPost<AutoImportRunResult>("/reader3/autoImportRun", { forceFullScan }, { timeoutMs: 120_000 }),
 };
 
 /* ---------- Bookshelf, Reading, Groups, Bookmarks & Local Import ---------- */
