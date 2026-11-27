@@ -33,21 +33,23 @@ type PreviewData = {
   preview: Array<{ id: number; detailUrl: string; jsonUrl: string | null; error?: string }>;
 };
 
-export function AutoImportSection() {
-  const [config, setConfig] = useState<AutoImportSettings | null>(null);
-  const [preview, setPreview] = useState<PreviewData | null>(null);
-  const [invalidList, setInvalidList] = useState<InvalidBookSource[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [previewing, setPreviewing] = useState(false);
-  const [listUrlDraft, setListUrlDraft] = useState("");
-  const listUrlTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+// 模块级缓存：SPA 存活期间跨 mount 保留，重新进“用户管理”不重新拉网络（避免每次进页面都要加载）
+// 带 TTL（5 分钟），超过则后台静默刷新一次。
+type AutoImportCache = {
+  config: AutoImportSettings | null;
+  preview: PreviewData | null;
+  invalidList: InvalidBookSource[];
+  ts: number;
+};
+const CACHE_TTL_MS = 5 * 60 * 1000;
+let moduleCache: AutoImportCache | null = null;
+let prefetching: Promise<void> | null = null;
 
-  // 仅初次挂载全量拉取；之后用 refreshSilent（不切 loading，不卸载整块）
-  const refreshSilent = async () => {
-    try {
-      const pv = await autoImportApi.preview();
-      if (pv) {
-        setConfig({
+async function fetchAutoImport(): Promise<AutoImportCache> {
+  const [pv, inv] = await Promise.all([autoImportApi.preview(), sourcesApi.invalids()]);
+  return {
+    config: pv
+      ? {
           enabled: pv.enabled,
           scheduleType: pv.scheduleType ?? "daily",
           dailyTime: pv.dailyTime ?? "03:00",
@@ -58,27 +60,77 @@ export function AutoImportSection() {
           lastRunAt: pv.lastRunAt,
           lastResult: pv.lastResult,
           lastImportedCount: pv.lastImportedCount,
-        });
-        setListUrlDraft(pv.listUrl);
-        setPreview({
+        }
+      : null,
+    preview: pv
+      ? {
           listUrl: pv.listUrl,
           lastId: pv.lastId,
           pendingCount: pv.pendingCount,
           preview: pv.preview ?? [],
-        });
+        }
+      : null,
+    invalidList: inv ?? [],
+    ts: Date.now(),
+  };
+}
+
+// 提前预取：在登录态就绪后调用，让“用户管理→书源自动导入”数据就绪，进页面秒开
+export function prefetchAutoImport(force = false): void {
+  if (!force && moduleCache && Date.now() - moduleCache.ts < CACHE_TTL_MS) return;
+  if (prefetching && !force) return;
+  prefetching = fetchAutoImport()
+    .then((c) => {
+      moduleCache = c;
+    })
+    .catch(() => {
+      /* 预取失败不阻断，进页面时再拉 */
+    })
+    .finally(() => {
+      prefetching = null;
+    });
+}
+
+export function AutoImportSection() {
+  const [config, setConfig] = useState<AutoImportSettings | null>(null);
+  const [preview, setPreview] = useState<PreviewData | null>(null);
+  const [invalidList, setInvalidList] = useState<InvalidBookSource[]>([]);
+  const [loading, setLoading] = useState(() => {
+    // 有新鲜模块缓存则直接渲染，不闪 loading
+    return !moduleCache || Date.now() - moduleCache.ts > CACHE_TTL_MS;
+  });
+  const [previewing, setPreviewing] = useState(false);
+  const [listUrlDraft, setListUrlDraft] = useState("");
+  const listUrlTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // 静默拉取并更新模块缓存 + 本地 state（不切 loading，不卸载整块）
+  const refreshSilent = async (force = false) => {
+    try {
+      const c = force || !moduleCache ? await fetchAutoImport() : moduleCache;
+      moduleCache = c;
+      if (c.config) {
+        setConfig(c.config);
+        setListUrlDraft(c.config.listUrl);
       }
-      const inv = await sourcesApi.invalids();
-      setInvalidList(inv ?? []);
+      if (c.preview) setPreview(c.preview);
+      setInvalidList(c.invalidList);
+      setLoading(false);
     } catch {
-      // silent
+      setLoading(false);
     }
   };
 
   useEffect(() => {
-    (async () => {
-      await refreshSilent();
+    // 有新鲜缓存：直接用，不发网络；过期或无缓存：拉一次并缓存
+    if (moduleCache && Date.now() - moduleCache.ts < CACHE_TTL_MS) {
+      setConfig(moduleCache.config);
+      setPreview(moduleCache.preview);
+      setInvalidList(moduleCache.invalidList);
       setLoading(false);
-    })();
+    } else {
+      setLoading(true);
+      void refreshSilent(true);
+    }
     return () => {
       if (listUrlTimer.current) clearTimeout(listUrlTimer.current);
     };
@@ -101,7 +153,7 @@ export function AutoImportSection() {
     } catch (e) {
       notify.error(e instanceof Error ? e.message : "保存失败");
       // 失败则回滚：重新拉取真实状态
-      await refreshSilent();
+      await refreshSilent(true);
     }
   };
 
@@ -122,8 +174,8 @@ export function AutoImportSection() {
         `导入 ${res.importedEntries} 个合集 / ${res.importedSources} 个书源` +
           (res.deletedInvalid > 0 ? `，删除 ${res.deletedInvalid} 个失效源` : ""),
       );
-      // 执行后只更新预览/统计，不切 loading
-      await refreshSilent();
+      // 执行后拉新数据并更新缓存
+      await refreshSilent(true);
     } catch (e) {
       notify.error(e instanceof Error ? e.message : "执行失败");
     } finally {
@@ -135,7 +187,7 @@ export function AutoImportSection() {
     try {
       const res = await sourcesApi.deleteInvalid();
       notify.success(`已删除 ${res.deleted} 个失效书源`);
-      await refreshSilent();
+      await refreshSilent(true);
     } catch (e) {
       notify.error(e instanceof Error ? e.message : "删除失效源失败");
     }
