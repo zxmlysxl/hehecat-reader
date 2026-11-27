@@ -58,6 +58,9 @@ pub struct SearchBook {
     pub time: i64,
     pub variable: Option<String>,
     pub origin_order: i64,
+    /// 该源本次搜索的真实测速耗时（毫秒），换源列表用它显示"测速"而非累计等待
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<i64>,
 }
 
 /// ruleSearch 结构（legacy BookListRule 字段）

@@ -31,6 +31,7 @@ import { buildReaderUrl, cleanChapterTitle, stripDuplicateHeading } from "@/lib/
 import { getReaderOrigin } from "@/lib/readerOrigin";
 import { useNotesStore, type ReadingNote } from "@/stores/notes";
 import { usePrefsStore } from "@/stores/prefs";
+import { KeepScreenAwake, releaseKeepScreenAwake } from "@/lib/keepScreenAwake";
 import { notify } from "@/stores/toast";
 import { BookCover } from "@/ui/BookCover";
 import { Button } from "@/ui/Button";
@@ -422,19 +423,23 @@ export default function ReaderPage() {
     forceNextSaveRef.current = false;
     setRemoteSyncBanner(null);
 
-    // If opened with an explicit stale ?index= while server already has a different newer position, prompt to sync
+    // 默认直接采用服务器最新进度，不再弹"同步跳转"确认条。
+    // 仅当 URL 显式带了过期 ?index=（如从别处的旧链接进来）时，静默跟随最新进度。
     if (
       parsedUrlIndex !== null &&
       shelfBook &&
       remoteTime > 0 &&
       shelfBook.durChapterIndex !== parsedUrlIndex
     ) {
-      setRemoteSyncBanner({
-        durChapterIndex: shelfBook.durChapterIndex,
-        durChapterPos: shelfBook.durChapterPos ?? 0,
-        durChapterTitle: shelfBook.durChapterTitle || "",
-        durChapterTime: remoteTime,
-      });
+      const syncIdx = shelfBook.durChapterIndex;
+      const syncPos = shelfBook.durChapterPos ?? 0;
+      syncedPosRef.current = { chapterIndex: syncIdx, paraIndex: syncPos };
+      setChapterIndex(syncIdx);
+      setJumpSignal((prev) => ({ paraIndex: syncPos, align: "start", nonce: prev.nonce + 1 }));
+      setTtsActive(false);
+      setAutoScrollActive(false);
+      notify.info(`已同步至其他设备的最新进度：第 ${syncIdx + 1} 章`);
+      return;
     }
 
     setChapterIndex(initIdx);
@@ -453,12 +458,13 @@ export default function ReaderPage() {
       shelfBook.durChapterIndex !== snap.chapterIndex ||
       Math.abs((shelfBook.durChapterPos ?? 0) - snap.paraIndex) >= 2;
     if (differs) {
-      setRemoteSyncBanner({
-        durChapterIndex: shelfBook.durChapterIndex,
-        durChapterPos: shelfBook.durChapterPos ?? 0,
-        durChapterTitle: shelfBook.durChapterTitle || "",
-        durChapterTime: remoteTime,
-      });
+      // 自动跟随：静默应用最新进度，不打断阅读
+      const syncIdx = shelfBook.durChapterIndex;
+      const syncPos = shelfBook.durChapterPos ?? 0;
+      baseChapterTimeRef.current = remoteTime;
+      syncedPosRef.current = { chapterIndex: syncIdx, paraIndex: syncPos };
+      setRemoteSyncBanner(null);
+      jumpToPosition(syncIdx, syncPos, "start");
     } else {
       baseChapterTimeRef.current = remoteTime;
     }
@@ -898,6 +904,17 @@ export default function ReaderPage() {
     const onFsChange = () => setIsFullscreen(Boolean(document.fullscreenElement));
     document.addEventListener("fullscreenchange", onFsChange);
     return () => document.removeEventListener("fullscreenchange", onFsChange);
+  }, []);
+
+  // 屏幕常亮：进入阅读页即保持唤醒，防止阅读时息屏（阅读的基本功能，无需设置）
+  // 实现对齐 zxmlysxl/reader，见 src/lib/keepScreenAwake.ts
+  React.useEffect(() => {
+    const controller = new KeepScreenAwake();
+    controller.start();
+    return () => {
+      controller.stop();
+      releaseKeepScreenAwake();
+    };
   }, []);
 
   // Notes grouped by paragraph for current chapter

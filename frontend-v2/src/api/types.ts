@@ -141,6 +141,8 @@ export type SearchBook = BookInfo & {
   originCount?: number;
   origins?: string[];
   bookSourceUrl?: string;
+  /** 该源本次搜索的真实测速耗时（毫秒），由后端换源 SSE 回传 */
+  latencyMs?: number;
 };
 
 export interface BookChapter {

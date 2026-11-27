@@ -209,20 +209,38 @@ export function BookInspectorSheet({
   const bookRef = React.useRef(book);
   bookRef.current = book;
 
+  // 统一标识一本书：bookUrl 可能被多个书源共用一个空参数模板 URL
+  // （如 novel.html5.qq.com/qbread/api/novel/bookInfo?resourceId=），
+  // 只靠 bookUrl 做依赖会导致切换卡片时面板不刷新、一直显示上一次那本书。
+  const bookIdentity = React.useMemo(
+    () =>
+      [
+        book?.bookUrl ?? "",
+        book?.name ?? "",
+        book?.author ?? "",
+        book?.origin ?? "",
+      ].join("\u0001"),
+    [book?.bookUrl, book?.name, book?.author, book?.origin],
+  );
+
   // Sync incoming book & initialTab when sheet opens or target changes
   React.useEffect(() => {
     if (open && bookRef.current) {
       setActiveBook(bookRef.current);
       setTab(initialTab);
     }
-  }, [open, book?.bookUrl, initialTab]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, bookIdentity, initialTab]);
 
-  // Share shelf & groups cache with LibraryPage / CommandPalette
+  // Share shelf & groups cache with LibraryPage / CommandPalette.
+  // staleTime 0 + refetch on open：面板每次打开都取最新书架，避免用旧快照
+  // 误判"已在书房"（曾导致搜索结果的移出操作作用到别的书）。
   const { data: shelf = [] } = useQuery({
     queryKey: ["shelf"],
     queryFn: () => booksApi.getShelf(),
     enabled: open,
-    staleTime: 30_000,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
 
   const { data: groups = [] } = useQuery({
@@ -232,18 +250,20 @@ export function BookInspectorSheet({
     staleTime: 60_000,
   });
 
+  // 判定"已在书房"必须 URL + 书名都匹配：
+  // 很多书源共用带空参数的模板 bookUrl（如 .../bookInfo?resourceId=），
+  // 只比 URL 会把所有来自该源的书都认成同一本。
+  // URL + 书名双校验：共享空模板 URL（.../bookInfo?resourceId=）会让所有书
+  // 命中同一条书架记录，必须用书名排除。
   const shelfMatch = React.useMemo(() => {
-    if (!activeBook) return undefined;
-    const byUrl = shelf.find((b) => b.bookUrl === activeBook.bookUrl);
-    if (byUrl) return byUrl;
-    if (activeBook.name) {
-      return shelf.find(
-        (b) =>
-          b.name === activeBook.name &&
-          (!activeBook.author || !b.author || b.author === activeBook.author),
-      );
-    }
-    return undefined;
+    const url = activeBook?.bookUrl;
+    if (!url) return undefined;
+    const candidates = shelf.filter((b) => b.bookUrl === url);
+    if (candidates.length === 0) return undefined;
+    const norm = (v?: string | null) => (v ?? "").replace(/\s+/g, "").toLowerCase();
+    const myName = norm(activeBook?.name);
+    if (!myName) return candidates.length === 1 ? candidates[0] : undefined;
+    return candidates.find((b) => norm(b.name) === myName);
   }, [shelf, activeBook]);
 
   const onShelf = Boolean(shelfMatch);
@@ -708,6 +728,13 @@ export function BookInspectorSheet({
     retry: false,
   });
 
+  /** 全源重搜结束后刷新候选缓存（后端此时已把结果落库） */
+  const finishSourceSearch = React.useCallback(() => {
+    setSearchingSources(false);
+    // 后端在流结束时持久化候选源；这里取最新列表，退出再进也不会回退到旧数量
+    void queryClient.invalidateQueries({ queryKey: ["available-sources"] });
+  }, [queryClient]);
+
   const startAlternativeStream = React.useCallback(() => {
     if (!effectiveBookUrl || local) return;
     stopSourceStream();
@@ -751,7 +778,7 @@ export function BookInspectorSheet({
             mergeIncoming(frame.data ?? []);
           },
           onEnd: () => {
-            setSearchingSources(false);
+            finishSourceSearch();
           },
           onError: (err) => {
             // Fallback for preview books if bookSourceStream fails: search by exact title
@@ -766,18 +793,18 @@ export function BookInspectorSheet({
                     );
                     mergeIncoming(matching);
                   },
-                  onEnd: () => setSearchingSources(false),
-                  onError: () => setSearchingSources(false),
-                  onClose: () => setSearchingSources(false),
+                  onEnd: () => finishSourceSearch(),
+                  onError: () => finishSourceSearch(),
+                  onClose: () => finishSourceSearch(),
                 },
               );
             } else {
-              setSearchingSources(false);
+              finishSourceSearch();
               notify.error(err.message || "全源重搜失败");
             }
           },
           onClose: () => {
-            setSearchingSources(false);
+            finishSourceSearch();
           },
         },
       );
@@ -792,18 +819,18 @@ export function BookInspectorSheet({
             );
             mergeIncoming(matching);
           },
-          onEnd: () => setSearchingSources(false),
+          onEnd: () => finishSourceSearch(),
           onError: (err) => {
-            setSearchingSources(false);
+            finishSourceSearch();
             notify.error(err.message || "搜索候选书源失败");
           },
-          onClose: () => setSearchingSources(false),
+          onClose: () => finishSourceSearch(),
         },
       );
     } else {
       setSearchingSources(false);
     }
-  }, [effectiveBookUrl, effectiveOrigin, local, onShelf, displayName, stopSourceStream]);
+  }, [effectiveBookUrl, effectiveOrigin, local, onShelf, displayName, stopSourceStream, finishSourceSearch]);
 
   // Auto-discover alternatives for preview books when user switches to sources tab
   const autoTriggeredRef = React.useRef<string | null>(null);
@@ -856,9 +883,13 @@ export function BookInspectorSheet({
     const rows = allCandidates.map((cand, order) => {
       const origin = cand.origin || cand.bookSourceUrl || "";
       const key = candidateKey(cand);
+      // 优先后端回传的真实单源测速；sourceTimings 是"搜索开始至今的累计耗时"，不能当测速用
+      const fromServer = cand.latencyMs;
       const measured = sourceTimings[key];
       const historic = origin ? statLatencyMap.get(origin) : undefined;
-      const latencyMs = measured ?? historic;
+      const latencyMs =
+        fromServer !== undefined && fromServer !== null ? fromServer : (measured ?? historic);
+      const latencyIsReal = fromServer !== undefined && fromServer !== null;
       const latest = cleanChapterTitle(cand.latestChapterTitle);
       return {
         cand,
@@ -868,7 +899,11 @@ export function BookInspectorSheet({
         latest,
         chapterNo: extractChapterNo(latest),
         latencyMs,
-        latencySource: measured !== undefined ? ("live" as const) : historic ? ("history" as const) : null,
+        latencySource: latencyIsReal
+          ? ("live" as const)
+          : historic
+            ? ("history" as const)
+            : null,
         isCurrent:
           cand.bookUrl === effectiveBookUrl || (Boolean(origin) && origin === effectiveOrigin),
       };

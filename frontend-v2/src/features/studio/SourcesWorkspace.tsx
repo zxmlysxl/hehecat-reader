@@ -28,6 +28,7 @@ import {
   Trash2,
   Upload,
   X,
+  Activity,
 } from "lucide-react";
 import * as React from "react";
 import { useNavigate } from "react-router-dom";
@@ -43,6 +44,7 @@ import type {
 } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { buildReaderUrl, formatRelativeTime, splitSourceGroups } from "@/lib/format";
+import { requestKeepScreenAwakeNow } from "@/lib/keepScreenAwake";
 import { useAuthStore } from "@/stores/auth";
 import { usePrefsStore } from "@/stores/prefs";
 import { notify } from "@/stores/toast";
@@ -632,6 +634,56 @@ export default function SourcesWorkspace() {
     onError: (err) => notify.error(errText(err)),
   });
 
+  // ---- 书源失效检测（流式） ----
+  const [checking, setChecking] = React.useState(false);
+  const [checkProgress, setCheckProgress] = React.useState({ total: 0, checked: 0, invalid: 0 });
+  const checkStopRef = React.useRef<(() => void) | null>(null);
+
+  React.useEffect(() => () => checkStopRef.current?.(), []);
+
+  const startCheckSources = React.useCallback(() => {
+    if (checking) return;
+    setChecking(true);
+    setCheckProgress({ total: 0, checked: 0, invalid: 0 });
+    checkStopRef.current = sourcesApi.checkSourcesStream({
+      onData: (frame) => {
+        setCheckProgress({
+          total: frame.total ?? 0,
+          checked: frame.checked ?? 0,
+          invalid: frame.invalid ?? 0,
+        });
+      },
+      onEnd: (end) => {
+        setChecking(false);
+        setCheckProgress({
+          total: end?.total ?? 0,
+          checked: end?.checked ?? 0,
+          invalid: end?.invalid ?? 0,
+        });
+        invalidateAll();
+        qc.invalidateQueries({ queryKey: ["studio", "invalidSources"] });
+        notify.success(
+          `检测完成：${end?.checked ?? 0} 个书源，其中 ${end?.invalid ?? 0} 个失效`,
+        );
+      },
+      onError: (err) => {
+        setChecking(false);
+        notify.error(err.message || "检测失败");
+      },
+      onClose: () => setChecking(false),
+    });
+  }, [checking, invalidateAll, qc]);
+
+  const deleteInvalidMutation = useMutation({
+    mutationFn: () => sourcesApi.deleteInvalid(),
+    onSuccess: (res) => {
+      notify.success(`已删除 ${res.deleted} 个失效书源`);
+      invalidateAll();
+      qc.invalidateQueries({ queryKey: ["studio", "invalidSources"] });
+    },
+    onError: (err) => notify.error(errText(err)),
+  });
+
   const batchPublishMutation = useMutation({
     mutationFn: (urls: string[]) => sourcesApi.publishDefault(urls, "publish"),
     onSuccess: (res) => {
@@ -862,6 +914,41 @@ export default function SourcesWorkspace() {
               <Download className="size-3.5" />
               <span>导出</span>
             </button>
+
+            {/* 书源失效检测 */}
+            <button
+              type="button"
+              disabled={checking || sources.length === 0}
+              onClick={startCheckSources}
+              className="inline-flex h-8 cursor-pointer items-center gap-1 rounded-lg px-2 text-xs font-medium text-ink-secondary transition-colors hover:bg-subtle hover:text-ink disabled:opacity-45 md:rounded-full md:border md:border-line-strong md:bg-elevated md:px-3"
+              title="逐个探测书源站点，标记并列出失效书源"
+            >
+              <Activity className={cn("size-3.5", checking && "animate-pulse text-accent")} />
+              <span>
+                {checking
+                  ? `检测中 ${checkProgress.checked}/${checkProgress.total}`
+                  : "检测失效"}
+              </span>
+            </button>
+
+            {/* 删除全部失效书源（有失效项时才显示） */}
+            {(invalidMap.size > 0 || checkProgress.invalid > 0) ? (
+              <InlineConfirm
+                confirmLabel={`确认删除 ${Math.max(invalidMap.size, checkProgress.invalid)} 个失效书源`}
+                busy={deleteInvalidMutation.isPending}
+                onConfirm={() => deleteInvalidMutation.mutateAsync().then(() => undefined)}
+                trigger={(open) => (
+                  <button
+                    type="button"
+                    onClick={open}
+                    className="inline-flex h-8 cursor-pointer items-center gap-1 rounded-lg px-2 text-xs font-medium text-danger transition-colors hover:bg-danger/10 md:rounded-full md:border md:border-danger/40 md:bg-danger/5 md:px-3"
+                  >
+                    <Trash2 className="size-3.5" />
+                    <span>删除失效 ({Math.max(invalidMap.size, checkProgress.invalid)})</span>
+                  </button>
+                )}
+              />
+            ) : null}
 
             <button
               type="button"
@@ -2039,9 +2126,10 @@ function SourceInspector({
                           <p className="truncate text-[13px] font-medium text-ink">{book.name}</p>
                           <button
                             type="button"
-                            onClick={() =>
-                              navigate(buildReaderUrl(book.bookUrl, 0, source.bookSourceUrl))
-                            }
+                            onClick={() => {
+                              requestKeepScreenAwakeNow();
+                              navigate(buildReaderUrl(book.bookUrl, 0, source.bookSourceUrl));
+                            }}
                             className="inline-flex shrink-0 cursor-pointer items-center gap-0.5 text-[11px] text-accent hover:underline"
                           >
                             试读

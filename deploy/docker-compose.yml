@@ -1,38 +1,70 @@
 # reader 生产 compose: 镜像来自 GHCR (GitHub Actions 构建推送)
 # 快速起: cd deploy && docker compose up -d   (无需 .env, 默认单用户)
 # 多用户: 复制 .env.example 为 .env, 设 READER_APP_SECURE=true 与邀请码
-name: reader
+#
+# 所有可配置项都走 .env（见同目录 .env.example），此处只保留:
+#   - 容器内固定值（端口 8080、工作目录、静态资源根）
+#   - .env 变量的读取与默认值
+name: ${COMPOSE_PROJECT_NAME:-reader}
 
 services:
   reader:
-    image: ghcr.io/hehecat/reader:latest
+    image: ${READER_IMAGE:-ghcr.io/hehecat/reader:latest}
+    container_name: ${READER_CONTAINER_NAME:-reader}
     ports:
-      # 容器内固定 8080; 宿主端口可用 .env 的 READER_PORT 覆盖
+      # 容器内固定 8080; 宿主端口由 .env 的 READER_PORT 决定
       - "${READER_PORT:-8080}:8080"
     volumes:
-      # 用户数据/书架/缓存 sqlite (compose 自动创建)
-      - ./storage:/storage/storage
-      # 容器内 /data (杂项), 命名 volume 便于备份
+      # 用户数据/书架/缓存 sqlite
+      - ${READER_STORAGE_DIR:-./storage}:/storage/storage
+      # 容器内 /data (杂项)
       - data:/data
     environment:
+      # ---- 固定内部约定（一般不需要改）----
       READER_APP_WORKDIR: /storage
       READER_APP_WEB_ROOT: /app/web-ui/dist
-      # 书源抓取允许内网地址 (本地书同步等)
-      SSRF_ALLOW_PRIVATE: "${SSRF_ALLOW_PRIVATE:-false}"        # 图片/TTS/登录检测放行私网(自建部署)
-      READER_ALLOW_PRIVATE_SOURCE: "${READER_ALLOW_PRIVATE_SOURCE:-false}"  # 书源抓取放行私网(局域网/本地书源才开)
-      # 搜索抓取重试次数(死源排空速度); 源站普遍慢时可下调
-      READER_HTTP_RETRIES: "1"
-      READER_BROWSER_FIRST: "0"
-      # SQLite WAL 连接池上限
-      READER_DB_MAX_CONNECTIONS: "${READER_DB_MAX_CONNECTIONS:-24}"
-      # 默认单用户免登录；多用户安全模式可在 .env 设为 multi + true 并填写邀请码
-      READER_APP_MODE: "${READER_APP_MODE:-single}"
-      READER_APP_SECURE: "${READER_APP_SECURE:-false}"
-      READER_APP_INVITECODE: "${READER_APP_INVITECODE:-}"
-      TZ: Asia/Shanghai
-    # 需要接入外部网关或固定内网解析时, 写进
-    # docker-compose.override.yml(已 gitignore, 参考 docker-compose.override.yml.example)
-    restart: unless-stopped
+      TZ: ${TZ:-Asia/Shanghai}
+
+      # ---- 用户与安全模式 ----
+      READER_APP_MODE: ${READER_APP_MODE:-single}
+      READER_APP_SECURE: ${READER_APP_SECURE:-false}
+      READER_APP_SECUREKEY: ${READER_APP_SECUREKEY:-}
+      READER_APP_INVITECODE: ${READER_APP_INVITECODE:-}
+      READER_APP_MINUSERPASSWORDLENGTH: ${READER_APP_MINUSERPASSWORDLENGTH:-8}
+      READER_APP_USERLIMIT: ${READER_APP_USERLIMIT:-500000}
+      READER_APP_USERBOOKLIMIT: ${READER_APP_USERBOOKLIMIT:-500000}
+      READER_TOKEN_TTL_DAYS: ${READER_TOKEN_TTL_DAYS:-30}
+
+      # ---- 网络与抓取 ----
+      SSRF_ALLOW_PRIVATE: ${SSRF_ALLOW_PRIVATE:-false}
+      READER_ALLOW_PRIVATE_SOURCE: ${READER_ALLOW_PRIVATE_SOURCE:-false}
+      READER_HTTP_RETRIES: ${READER_HTTP_RETRIES:-1}
+      READER_BROWSER_FIRST: ${READER_BROWSER_FIRST:-0}
+      READER_DB_MAX_CONNECTIONS: ${READER_DB_MAX_CONNECTIONS:-24}
+
+      # ---- 搜索与换源性能 ----
+      # 单源抓取超时（秒）
+      READER_SEARCH_SOURCE_DEADLINE_SECS: ${READER_SEARCH_SOURCE_DEADLINE_SECS:-60}
+      # 全源换源并发数（按机器核数调；2 核建议 32-48，8 核可到 96）
+      READER_SWITCH_SEARCH_CONCURRENCY: ${READER_SWITCH_SEARCH_CONCURRENCY:-64}
+      # 换源单源超时（秒）
+      READER_SWITCH_SEARCH_TIMEOUT: ${READER_SWITCH_SEARCH_TIMEOUT:-8}
+      # 换源全量搜索总预算（秒）
+      READER_SWITCH_SEARCH_BUDGET_SECS: ${READER_SWITCH_SEARCH_BUDGET_SECS:-60}
+      # 书源失效检测并发（HEAD 探测，轻量）
+      READER_CHECK_SOURCES_CONCURRENCY: ${READER_CHECK_SOURCES_CONCURRENCY:-32}
+
+      # ---- 资源限制 ----
+      READER_UPLOAD_MAX_MB: ${READER_UPLOAD_MAX_MB:-100}
+
+    # 资源上限（.env 可覆盖；不设则不限）
+    mem_limit: ${READER_MEM_LIMIT:-3g}
+    mem_swappiness: ${READER_MEM_SWAPPINESS:-30}
+
+    restart: ${READER_RESTART_POLICY:-unless-stopped}
+
+# 需要接入外部网关或固定内网解析时, 写进
+# docker-compose.override.yml(已 gitignore, 参考 docker-compose.override.yml.example)
 
 volumes:
   data:

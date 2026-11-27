@@ -45,6 +45,26 @@ docker run -d --name reader -p 8080:8080 \
   ghcr.io/hehecat/reader:latest
 ```
 
+### 全部配置走 .env
+
+`deploy/docker-compose.yml` 只保留容器内部固定约定（端口 8080、工作目录、静态资源根），
+其余全部从 `.env` 读取，未设置时使用默认值。
+
+```bash
+cd deploy
+cp .env.example .env      # 按需修改，.env 已 gitignore
+docker compose up -d
+```
+
+`.env` 覆盖的配置分组：
+
+| 分组 | 关键变量 |
+|---|---|
+| 容器/端口 | `READER_PORT`、`READER_IMAGE`、`READER_STORAGE_DIR`、`READER_MEM_LIMIT` |
+| 用户与安全 | `READER_APP_MODE`、`READER_APP_SECURE`、`READER_APP_SECUREKEY`、`READER_APP_INVITECODE` |
+| 网络与抓取 | `READER_HTTP_RETRIES`、`READER_BROWSER_FIRST`、`SSRF_ALLOW_PRIVATE`、`READER_DB_MAX_CONNECTIONS` |
+| 搜索性能 | `READER_SEARCH_SOURCE_DEADLINE_SECS`、`READER_SWITCH_SEARCH_CONCURRENCY`、`READER_SWITCH_SEARCH_TIMEOUT`、`READER_CHECK_SOURCES_CONCURRENCY` |
+
 ### 开启多用户安全模式
 
 ```bash
@@ -53,9 +73,23 @@ cp .env.example .env
 # 在 .env 中设置：
 # READER_APP_MODE=multi
 # READER_APP_SECURE=true
-# READER_APP_INVITECODE=<你的邀请码>
+# READER_APP_SECUREKEY=<管理员密码>
+# READER_APP_INVITECODE=<你的邀请码，留空则不需要>
 docker compose up -d
 ```
+
+### 搜索性能调优（书源很多时）
+
+`READER_SWITCH_SEARCH_CONCURRENCY` 按机器核数设置，过高不会更快（2 核机上 96 与 48 实测差别很小）：
+
+| CPU 核数 | 建议并发 |
+|---|---|
+| 2 核 | 32 ~ 48 |
+| 4 核 | 64 |
+| 8 核+ | 96 ~ 128 |
+
+书源库很大时，先到「书源管理」→「检测失效」跑一遍检测，再「删除失效」，
+可显著减少每轮搜索被死源拖慢的时间。
 
 ---
 

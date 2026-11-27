@@ -203,6 +203,17 @@ export const sourcesApi = {
     ),
   stats: () => apiGet<SourceStat[]>("/reader3/getSourceStats"),
   invalids: () => apiGet<InvalidBookSource[]>("/reader3/getInvalidBookSources"),
+  /** 流式检测全部启用书源可用性：onData 逐源回传 {total,checked,invalid,source} */
+  checkSourcesStream: (
+    callbacks: SseCallbacks<
+      { total: number; checked: number; invalid: number; source?: {
+        bookSourceUrl: string; bookSourceName: string; ok: boolean; reason: string;
+      } },
+      { total: number; checked: number; invalid: number; isEnd: boolean }
+    >,
+  ) => openSseStream("/reader3/checkBookSourcesSSE", {}, callbacks),
+  /** 删除全部已标记失效的书源 */
+  deleteInvalid: () => apiPost<{ deleted: number }>("/reader3/deleteInvalidBookSources", {}),
   availableForBook: (url: string, refresh = 0) =>
     apiPost<SearchBook[]>("/reader3/getAvailableBookSource", { url, refresh }),
   previewRemote: (url: string) =>

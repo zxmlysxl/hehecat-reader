@@ -334,7 +334,13 @@ pub async fn search_book_source_sse(
                     .await;
                 return;
             }
-            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(24));
+            // 全源换源并发：默认 64（原先硬编码 24，几千个源要跑几小时）
+            let sw_concurrency: usize = std::env::var("READER_SWITCH_SEARCH_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(64)
+                .clamp(1, 256);
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(sw_concurrency));
             let mut tasks = futures::stream::FuturesUnordered::new();
             for (i, source) in sources.into_iter().enumerate() {
                 let sem = semaphore.clone();
@@ -344,11 +350,23 @@ pub async fn search_book_source_sse(
                 tasks.push(Box::pin(async move {
                     let _permit = sem.acquire().await;
                     let t0 = Instant::now();
+                    // 换源是"能搜到就收录"的场景，单源超时 8s 足够；
+                    // 15s 会让慢源拖死整批（4000 源 × 24 并发 ≈ 小时级）
+                    let sw_timeout: u64 = std::env::var("READER_SWITCH_SEARCH_TIMEOUT")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .unwrap_or(8)
+                        .clamp(3, 30);
                     let res = crate::service::search::search_one_source(
-                        &storage, &ns, &source, &key, 1, 15,
+                        &storage, &ns, &source, &key, 1, sw_timeout,
                     )
                     .await;
                     let lat = t0.elapsed().as_millis() as i64;
+                    // 把真实单源测速写进每条命中，前端据此显示「测速」而不是累计耗时
+                    let mut books = res.as_ref().map(|v| v.clone()).unwrap_or_default();
+                    for b in books.iter_mut() {
+                        b.latency_ms = Some(lat);
+                    }
                     let (outcome, intro_hits, intro_count) = match &res {
                         Ok(books) => (
                             crate::storage::SearchOutcome::Ok,
@@ -378,16 +396,23 @@ pub async fn search_book_source_sse(
                             )
                             .await;
                     }));
-                    (i as i64, res.unwrap_or_default())
+                    (i as i64, books)
                 }));
             }
 
             let mut last = -1i64;
             let mut seen = HashSet::new();
+            // 本次流式换源的全部命中，流结束后落候选表（否则退出界面即丢失）
+            let mut collected: Vec<crate::service::search::SearchBook> = Vec::new();
             let ql = key.to_lowercase();
+            // 关键：客户端断开（关面板/切页/curl 读完）不能直接 return，
+            // 否则下面的持久化永远执行不到。用 client_gone 标记后 break。
             loop {
                 let next = tokio::select! {
-                    _ = tx.closed() => return,
+                    _ = tx.closed() => {
+                        tracing::info!("换源 SSE 客户端提前断开，继续收尾持久化 ns={ns} key={key}");
+                        break;
+                    }
                     item = tasks.next() => item,
                 };
                 let Some((i, books)) = next else {
@@ -402,10 +427,22 @@ pub async fn search_book_source_sse(
                     })
                     .filter(|b| seen.insert(b.origin.clone()))
                     .collect();
+                collected.extend(matched.iter().cloned());
                 let payload = json!({ "lastIndex": i, "data": matched });
                 if tx.send(sse::data_event(&payload)).await.is_err() {
-                    return;
+                    // 发送失败 = 客户端已走，同样要收尾
+                    tracing::info!("换源 SSE 发送失败（客户端已断），继续收尾 ns={ns} key={key}");
+                    break;
                 }
+            }
+            // 持久化：与 getAvailableBookSource 共用同一张候选表，下次进入"换源"页直接可见
+            tracing::info!(
+                "换源 SSE 收尾 ns={} key={} collected={}",
+                ns, key, collected.len()
+            );
+            if !collected.is_empty() {
+                persist_search_candidates(&storage, &ns, &collected).await;
+                tracing::info!("换源 SSE 已写入候选表 ns={} 条数={}", ns, collected.len());
             }
             let _ = tx
                 .send(sse::named_event(
@@ -637,6 +674,11 @@ pub async fn search_book_multi_sse(
                     )
                     .await;
                     let lat = t0.elapsed().as_millis() as i64;
+                    // 把真实单源测速写进每条命中，前端据此显示「测速」而不是累计耗时
+                    let mut books = res.as_ref().map(|v| v.clone()).unwrap_or_default();
+                    for b in books.iter_mut() {
+                        b.latency_ms = Some(lat);
+                    }
                     let (outcome, intro_hits, intro_count) = match &res {
                         Ok(books) => (
                             crate::storage::SearchOutcome::Ok,
@@ -667,12 +709,16 @@ pub async fn search_book_multi_sse(
                             )
                             .await;
                     }));
-                    let books = res.unwrap_or_default();
-                    let books = if exact {
-                        crate::service::search::filter_exact(books, &key)
+                    let base = res.unwrap_or_default();
+                    let mut filtered = if exact {
+                        crate::service::search::filter_exact(base, &key)
                     } else {
-                        books
+                        base
                     };
+                    for b in filtered.iter_mut() {
+                        b.latency_ms = Some(lat);
+                    }
+                    let books = filtered;
                     let mut unique = Vec::with_capacity(books.len());
                     let mut local_seen = HashSet::new();
                     for b in books {

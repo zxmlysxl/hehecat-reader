@@ -32,6 +32,7 @@ import { ImportBookSheet } from "@/features/book/ImportBookSheet";
 import { GroupManagerSheet } from "@/features/library/GroupManagerSheet";
 import { cn } from "@/lib/cn";
 import { buildReaderUrl, cleanChapterTitle, cleanIntro, formatRelativeTime } from "@/lib/format";
+import { requestKeepScreenAwakeNow } from "@/lib/keepScreenAwake";
 import { notify } from "@/stores/toast";
 import { BookCover } from "@/ui/BookCover";
 import { Button, IconButton } from "@/ui/Button";
@@ -383,7 +384,10 @@ export default function LibraryPage() {
     setImportOpen(true);
   };
 
-  const readBook = (book: Book) => navigate(buildReaderUrl(book.bookUrl, book.durChapterIndex));
+  const readBook = (book: Book) => {
+    requestKeepScreenAwakeNow();
+    navigate(buildReaderUrl(book.bookUrl, book.durChapterIndex));
+  };
 
   const clearFilters = () => {
     setActiveGroup("all");

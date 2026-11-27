@@ -295,6 +295,7 @@ pub(crate) fn single_search_book(
         toc_url: info.toc_url.unwrap_or_default(),
         time: chrono::Utc::now().timestamp_millis(),
         variable: None,
+        latency_ms: None,
     }
 }
 

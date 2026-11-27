@@ -47,6 +47,8 @@ const EASE_OUT_QUINT = [0.22, 1, 0.36, 1] as const;
 
 interface AggregatedBook {
   key: string;
+  /** 渲染用唯一 id：key 可能因书源返回空书名/作者而重复，绝不能单独用作 React key */
+  uid: string;
   primary: SearchBook;
   sources: SearchBook[];
 }
@@ -94,7 +96,12 @@ function mergeSearchBooks(
     const key = normalizeBookKey(item.name, item.author);
     const existing = next.get(key);
     if (!existing) {
-      next.set(key, { key, primary: item, sources: [item] });
+      next.set(key, {
+        key,
+        uid: `${key}#${item.bookUrl}`,
+        primary: item,
+        sources: [item],
+      });
       continue;
     }
     const originId = `${item.origin || item.bookSourceUrl || ""}::${item.bookUrl}`;
@@ -120,6 +127,7 @@ function mergeSearchBooks(
           };
     next.set(key, {
       key,
+      uid: existing.uid,
       primary: betterPrimary,
       sources: updatedSources,
     });
@@ -148,10 +156,14 @@ export default function DiscoverPage() {
   const clearSearchHistory = usePrefsStore((s) => s.clearSearchHistory);
 
   // Share shelf cache so we know which books are already in library
+  // refreshOnMount "always"：书架在其他页面增删后，回到搜索页必须拿到最新列表，
+  // 否则会一直显示"已在书房"（缓存 30s 的旧快照）。
   const { data: shelf = [] } = useQuery({
     queryKey: ["shelf"],
     queryFn: () => booksApi.getShelf(),
-    staleTime: 30_000,
+    staleTime: 0,
+    refetchOnMount: "always",
+    refetchOnWindowFocus: true,
   });
 
   // Load source list lite for source group filtering
@@ -172,15 +184,32 @@ export default function DiscoverPage() {
     return Array.from(set).sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
   }, [sourcesLite]);
 
+  // 书架 URL → 书名 映射。
+  // 关键防御：部分书源会把 URL 拼成共享的空参数模板
+  // （如 .../bookInfo?resourceId=），所有书拿到同一个 bookUrl。
+  // 这种情况下"URL 命中"并不代表这本书在架，必须再用书名核对。
   const shelfLookup = React.useMemo(() => {
     const urls = new Set<string>();
-    const keys = new Set<string>();
+    const nameByUrl = new Map<string, string>();
     for (const b of shelf) {
       urls.add(b.bookUrl);
-      keys.add(normalizeBookKey(b.name, b.author));
+      if (b.name) nameByUrl.set(b.bookUrl, b.name);
     }
-    return { urls, keys };
+    return { urls, nameByUrl };
   }, [shelf]);
+
+  /** 搜索结果是否真的在书房：URL 命中 且 书名一致（防止共享空模板 URL 误判） */
+  const isOnShelf = React.useCallback(
+    (bookUrl?: string | null, name?: string | null) => {
+      if (!bookUrl || !shelfLookup.urls.has(bookUrl)) return false;
+      const shelfName = shelfLookup.nameByUrl.get(bookUrl);
+      if (!shelfName) return true;
+      if (!name) return false;
+      const norm = (v: string) => v.replace(/\s+/g, "").toLowerCase();
+      return norm(shelfName) === norm(name);
+    },
+    [shelfLookup],
+  );
 
   /* ---------------- Search State ---------------- */
   const currentUserKey = useAuthStore((s) => s.user?.username ?? "__local__");
@@ -404,10 +433,20 @@ export default function DiscoverPage() {
         const primary = validSources.some((s) => s.bookUrl === item.primary.bookUrl)
           ? item.primary
           : validSources[0]!;
-        list.push({ key: item.key, primary, sources: validSources });
+        list.push({ key: item.key, uid: item.uid, primary, sources: validSources });
       } else {
         list.push(item);
       }
+    }
+
+    // 保证 uid 唯一（同一本书可能因多个书源合并异常而出现重复 key）
+    const seen = new Set<string>();
+    for (let i = 0; i < list.length; i++) {
+      const it = list[i]!;
+      let u = it.uid ?? `${it.key}#${i}`;
+      while (seen.has(u)) u = `${u}~${i}`;
+      seen.add(u);
+      it.uid = u;
     }
 
     return list.sort((a, b) => {
@@ -852,14 +891,14 @@ export default function DiscoverPage() {
           ) : (
             <div className="divide-y divide-line/70 md:grid md:grid-cols-1 md:gap-4 md:divide-y-0 lg:grid-cols-2">
               <AnimatePresence initial={false}>
-                {displayedResults.map((item) => (
+                {displayedResults.map((item, itemIdx) => (
                   <DiscoverResultCard
-                    key={item.key}
+                    key={item.uid ?? `${item.key}#${itemIdx}`}
                     item={item}
                     reduced={Boolean(reduced)}
-                    onShelf={
-                      shelfLookup.urls.has(item.primary.bookUrl) || shelfLookup.keys.has(item.key)
-                    }
+                    onShelf={item.sources.some((src) =>
+                      isOnShelf(src.bookUrl, src.name ?? item.primary.name),
+                    )}
                     saving={savingBookKey === item.key}
                     onOpen={() =>
                       setInspectorBook({

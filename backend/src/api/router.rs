@@ -296,6 +296,14 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
             get(sources::get_invalid_book_sources).post(sources::get_invalid_book_sources),
         )
         .route(
+            "/reader3/checkBookSourcesSSE",
+            get(sources::check_book_sources_sse).post(sources::check_book_sources_sse),
+        )
+        .route(
+            "/reader3/deleteInvalidBookSources",
+            post(sources::delete_invalid_book_sources),
+        )
+        .route(
             "/reader3/getAvailableBookSource",
             get(sources::get_available_book_source).post(sources::get_available_book_source),
         )

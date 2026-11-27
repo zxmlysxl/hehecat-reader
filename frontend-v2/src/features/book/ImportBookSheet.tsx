@@ -17,6 +17,7 @@ import { booksApi } from "@/api/endpoints";
 import type { BookInfo, ImportBookPreview } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { buildReaderUrl, cleanIntro, formatBytes } from "@/lib/format";
+import { requestKeepScreenAwakeNow } from "@/lib/keepScreenAwake";
 import { notify } from "@/stores/toast";
 import { BookCover } from "@/ui/BookCover";
 import { Button, IconButton } from "@/ui/Button";
@@ -165,6 +166,7 @@ export function ImportBookSheet({
               onClick={() => {
                 const targetUrl = importedBook.bookUrl;
                 handleClose();
+                requestKeepScreenAwakeNow();
                 navigate(buildReaderUrl(targetUrl, 0));
               }}
             >

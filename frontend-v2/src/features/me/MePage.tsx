@@ -27,6 +27,7 @@ import {
   formatRelativeTime,
   formatUptime,
 } from "@/lib/format";
+import { requestKeepScreenAwakeNow } from "@/lib/keepScreenAwake";
 import { useAuthStore } from "@/stores/auth";
 import { BookCover } from "@/ui/BookCover";
 import { Button } from "@/ui/Button";
@@ -214,6 +215,7 @@ export default function MePage() {
   }, [sortedByRecent, footprintFilter, footprintExpanded]);
 
   const openReader = (book: Book) => {
+    requestKeepScreenAwakeNow();
     navigate(buildReaderUrl(book.bookUrl, book.durChapterIndex));
   };
 

@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use super::auth::{check_manager_auth, resolve_namespace};
 use super::router::{param_of, AppState, ReturnData};
 use super::sse;
+use futures::StreamExt;
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -280,8 +281,11 @@ pub async fn save_from_remote_source(
     if url.is_empty() {
         return Json(ReturnData::err("请输入远程书源链接")).into_response();
     }
+    // 源仓库（shuyuan.yiove.com）的书源合集页是 SPA，页面本身没有 JSON。
+    // 识别 /book-source-collection/<uuid> 形式后改走它的公开 API。
+    let url = rewrite_yiove_collection_url(&url);
     let headers_map: HashMap<String, String> = HashMap::new();
-    let resp = match crate::service::crawler::fetch(&url, &headers_map, 15, "GET", None, None, None)
+    let resp = match crate::service::crawler::fetch(&url, &headers_map, 60, "GET", None, None, None)
         .await
     {
         Ok(r) => r,
@@ -392,6 +396,153 @@ pub async fn delete_book_sources(
     for url in &urls {
         if let Ok(n) = state.storage.delete_book_source(&namespace, url).await {
             deleted += n;
+        }
+    }
+    Json(ReturnData::ok(json!({ "deleted": deleted })))
+}
+
+/// 把源仓库 SPA 页面 URL 重写为它的 JSON API。
+/// 支持：
+/// - https://shuyuan.yiove.com/book-source-collection/<uuid>
+/// - https://shuyuan.yiove.com/book-source-search/<uuid>-<index>/<keyword>
+/// 其它 URL 原样返回。
+fn rewrite_yiove_collection_url(input: &str) -> String {
+    let trimmed = input.trim();
+    let Some(rest) = trimmed
+        .strip_prefix("https://shuyuan.yiove.com")
+        .or_else(|| trimmed.strip_prefix("http://shuyuan.yiove.com"))
+    else {
+        return trimmed.to_string();
+    };
+    let path = rest.trim_end_matches('/');
+    // /book-source-collection/<uuid>
+    if let Some(uuid) = path.strip_prefix("/book-source-collection/") {
+        if !uuid.is_empty() && !uuid.contains('/') {
+            return format!("https://shuyuan-api.yiove.com/import/book-source-collection/{uuid}");
+        }
+    }
+    // /book-source-search/<uuid>-<page>/<keyword>
+    if let Some(tail) = path.strip_prefix("/book-source-search/") {
+        let mut parts = tail.splitn(2, '/');
+        let id_page = parts.next().unwrap_or("");
+        let keyword = parts.next().unwrap_or("");
+        if !id_page.is_empty() && !keyword.is_empty() {
+            return format!(
+                "https://shuyuan-api.yiove.com/import/book-source-search/{id_page}/{}",
+                keyword
+            );
+        }
+    }
+    trimmed.to_string()
+}
+
+/// GET/POST `/reader3/checkBookSourcesSSE`：流式检测全部启用书源的可用性，
+/// 逐个回传失效书源，结束后把失效清单写进内存快照（供 /getInvalidBookSources 读）
+pub async fn check_book_sources_sse(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    _body: Option<axum::body::Bytes>,
+) -> Response {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return sse::sse_error(ret),
+    };
+    let sources: Vec<crate::model::BookSource> =
+        match state.storage.get_book_sources(&namespace).await {
+            Ok(s) => s.into_iter().filter(|s| s.enabled).collect(),
+            Err(_) => {
+                return sse::sse_error(ReturnData::err("系统错误"));
+            }
+        };
+
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let ns = namespace.clone();
+    tokio::spawn(async move {
+        let total = sources.len();
+        let _ = tx
+            .send(sse::data_event(
+                &json!({ "total": total, "checked": 0, "invalid": 0 }),
+            ))
+            .await;
+
+        // 并发探测：默认 32（HEAD 请求很轻，比换源搜索省得多）
+        let concurrency: usize = std::env::var("READER_CHECK_SOURCES_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(32)
+            .clamp(1, 128);
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let mut tasks = futures::stream::FuturesUnordered::new();
+        for source in sources.into_iter() {
+            let sem = semaphore.clone();
+            let nsx = ns.clone();
+            tasks.push(Box::pin(async move {
+                let _permit = sem.acquire().await;
+                let (ok, reason) =
+                    crate::service::health::check_source(&nsx, &source).await;
+                (source, ok, reason)
+            }));
+        }
+
+        let mut checked = 0usize;
+        let mut invalid_count = 0usize;
+        while let Some((source, ok, reason)) = tasks.next().await {
+            checked += 1;
+            if ok {
+                crate::service::health::clear_source_invalid(&ns, &source.book_source_url);
+            } else {
+                invalid_count += 1;
+                crate::service::health::mark_source_invalid(
+                    &ns,
+                    &source.book_source_url,
+                    &reason,
+                );
+            }
+            let payload = json!({
+                "total": total,
+                "checked": checked,
+                "invalid": invalid_count,
+                "source": {
+                    "bookSourceUrl": source.book_source_url,
+                    "bookSourceName": source.book_source_name,
+                    "ok": ok,
+                    "reason": reason,
+                }
+            });
+            if tx.send(sse::data_event(&payload)).await.is_err() {
+                // 客户端断开：探测仍继续（写快照），只是不再推送
+                continue;
+            }
+        }
+        let _ = tx
+            .send(sse::named_event(
+                "end",
+                &json!({ "total": total, "checked": checked, "invalid": invalid_count, "isEnd": true }),
+            ))
+            .await;
+    });
+
+    sse::sse_from_receiver(rx)
+}
+
+/// POST `/reader3/deleteInvalidBookSources`：删除全部已标记失效的书源
+pub async fn delete_invalid_book_sources(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    _body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let snapshot = crate::service::health::invalid_snapshot(&namespace);
+    let mut deleted = 0u64;
+    for (url, _time, _err) in snapshot {
+        if let Ok(n) = state.storage.delete_book_source(&namespace, &url).await {
+            deleted += n;
+            crate::service::health::clear_source_invalid(&namespace, &url);
         }
     }
     Json(ReturnData::ok(json!({ "deleted": deleted })))
