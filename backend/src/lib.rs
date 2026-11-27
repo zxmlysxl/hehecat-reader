@@ -156,6 +156,8 @@ impl AppConfig {
         service::local_sync::spawn_local_sync(storage.clone());
         // 定时书架更新检查（每 10 分钟）
         service::schedule::spawn_schedule_jobs(storage.clone());
+        // 远程书源自动导入（按命名空间配置，检查间隔 10 分钟）
+        service::auto_import::spawn_auto_import_job(storage.clone());
         // 自动备份（每天 READER_AUTO_BACKUP_HOUR，默认 03:00）
         service::schedule::spawn_auto_backup_job(storage.clone());
         let app = api::router(self.clone(), storage);

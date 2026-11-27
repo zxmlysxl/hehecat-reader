@@ -20,7 +20,7 @@ use axum::routing::{get, post};
 use axum::Json;
 use serde_json::{json, Value};
 
-use crate::api::{assets, auth, books, features, files, search, sources};
+use crate::api::{assets, auth, auto_import, books, features, files, search, sources};
 use crate::storage::Storage;
 
 /// 统一 API 返回结构（`isSuccess` / `errorMsg` / `data`，camelCase；默认 `T = Value` 保持 100% 向后兼容）
@@ -302,6 +302,18 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route(
             "/reader3/deleteInvalidBookSources",
             post(sources::delete_invalid_book_sources),
+        )
+        .route(
+            "/reader3/getAutoImportConfig",
+            get(auto_import::get_auto_import_config).post(auto_import::get_auto_import_config),
+        )
+        .route(
+            "/reader3/setAutoImportConfig",
+            post(auto_import::set_auto_import_config),
+        )
+        .route(
+            "/reader3/runAutoImportNow",
+            post(auto_import::run_auto_import_now),
         )
         .route(
             "/reader3/getAvailableBookSource",

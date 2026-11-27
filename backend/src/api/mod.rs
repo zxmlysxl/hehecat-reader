@@ -1,6 +1,7 @@
 //! HTTP API（`/reader3/*` 及静态资源/媒体路由）
 
 pub mod assets;
+pub mod auto_import;
 pub mod auth;
 pub mod books;
 pub mod features;

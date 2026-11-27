@@ -1,5 +1,6 @@
 //! 业务服务（书源 / 书架 / 书籍 / 本地书 / 搜索 / TTS）
 
+pub mod auto_import;
 pub mod book;
 pub mod browser;
 pub mod cache_job;

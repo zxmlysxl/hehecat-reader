@@ -71,6 +71,31 @@ export const usersApi = {
     apiPost<{ deleted: string[]; count: number }>("/reader3/clearInactiveUsers", { inactiveDay }),
 };
 
+export interface AutoImportConfig {
+  enabled: boolean;
+  intervalMinutes: number;
+  listUrl: string;
+  lastId: number;
+  lastRunAt: number;
+  lastResult: string;
+  lastImportedCount: number;
+}
+
+export interface AutoImportRunResult {
+  scanned: number;
+  importedEntries: number;
+  importedSources: number;
+  lastId: number;
+  details: string[];
+}
+
+export const autoImportApi = {
+  getConfig: () => apiGet<AutoImportConfig>("/reader3/getAutoImportConfig"),
+  setConfig: (body: { enabled?: boolean; intervalMinutes?: number; listUrl?: string }) =>
+    apiPost<AutoImportConfig>("/reader3/setAutoImportConfig", body),
+  runNow: () => apiPost<AutoImportRunResult>("/reader3/runAutoImportNow", {}),
+};
+
 /* ---------- Bookshelf, Reading, Groups, Bookmarks & Local Import ---------- */
 
 export interface RemoteBookProgress {

@@ -30,6 +30,7 @@ import * as React from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { fileDownloadUrl, fontFileUrl } from "@/api/client";
 import { featuresApi } from "@/api/endpoints";
+import { AutoImportSection } from "@/features/settings/AutoImportSection";
 import type { CustomFont, HttpTts, RestoreReport } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { formatBytes, formatRelativeTime, formatUptime } from "@/lib/format";
@@ -2360,6 +2361,9 @@ function AccountSection() {
           </div>
         </SettingsCard>
       </SettingsSection>
+
+      {/* Remote Book Source Auto Import (admin only) */}
+      {isMulti && isAdmin ? <AutoImportSection /> : null}
 
       {/* Seamless Admin Users Management */}
       {isMulti && isAdmin ? <UsersSection /> : null}
