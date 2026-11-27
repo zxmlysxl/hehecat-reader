@@ -62,7 +62,9 @@ export function ImportBookSheet({
     setImportedBook(null);
     setPreviewLoading(true);
     try {
-      const res = await booksApi.previewLocalBook(target);
+      // 大文件（>10MB）预览易超时：按文件大小动态给超时（基础 120s，每 10MB +30s，上限 600s）
+      const ms = Math.min(600_000, 120_000 + Math.max(0, target.size - 10 * 1024 * 1024) / (10 * 1024 * 1024) * 30_000);
+      const res = await booksApi.previewLocalBook(target, ms);
       setPreview(res);
     } catch (err) {
       setPreviewError(err instanceof Error ? err.message : "文件解析失败，请检查文件编码或格式");
@@ -373,6 +375,11 @@ export function ImportBookSheet({
             </div>
 
             {/* Preview Content */}
+            {file.size > 20 * 1024 * 1024 && !preview ? (
+              <div className="rounded-xl border border-warning/30 bg-warning/10 px-3 py-2 text-[11px] text-ink-muted">
+                文件较大（{formatBytes(file.size)}），目录预览可能超时——可直接点右下角「收入书房」上传，上传成功后目录会自动解析
+              </div>
+            ) : null}
             {previewLoading ? (
               <div className="flex flex-col items-center justify-center gap-3 rounded-2xl border border-line bg-elevated/55 py-12">
                 <Spinner label="正在解析书目信息与目录结构…" />

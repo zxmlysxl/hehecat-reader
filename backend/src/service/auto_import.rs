@@ -26,7 +26,11 @@ const MAX_LIST_PAGES: usize = 5;
 const MAX_IMPORT_PER_RUN: usize = 20;
 
 /// 合集详情页 → json 订阅地址
-const DETAIL_JSON_RE: &str = r#"https?://[^s"''<>]+.json"#;
+/// 兼容两种格式：
+///   https://www.yckceo.com/yuedu/shuyuans/json/1349.json        （无中间 id 段）
+///   https://www.yckceo.com/yuedu/shuyuans/json/id/1349.json     （带中间 id 段，当前实际格式）
+/// 旧正则 `[^s"''<>]+` 是排除字符集（排除 s），而 URL 路径含 "shuyuans"（有 s）→ 匹配失败。
+const DETAIL_JSON_RE: &str = r#"https?://[\w./?&=%-]*shuyuans/json(?:/id)?/\d+\.json"#;
 
 /// 列表页条目链接：/yuedu/shuyuans/content/id/1349.html
 const LIST_ID_RE: &str = r#"/content/id/(\d+)\.html"#;

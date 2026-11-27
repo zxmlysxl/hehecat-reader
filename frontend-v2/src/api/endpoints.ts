@@ -194,10 +194,10 @@ export const booksApi = {
     apiPost<{ count: number }>("/reader3/deleteBookmarks", { bookUrl, ids }),
 
   // Local TXT / EPUB Import
-  previewLocalBook: (file: File) => {
+  previewLocalBook: (file: File, timeoutMs?: number) => {
     const form = new FormData();
     form.append("file", file);
-    return apiPost<ImportBookPreview>("/reader3/importBookPreview", form, { timeoutMs: 120_000 });
+    return apiPost<ImportBookPreview>("/reader3/importBookPreview", form, { timeoutMs: timeoutMs ?? 120_000 });
   },
   uploadLocalBook: (file: File) => {
     const form = new FormData();
