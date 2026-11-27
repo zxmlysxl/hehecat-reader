@@ -34,6 +34,16 @@ export interface ImportBookSheetProps {
 
 const ACCEPTED_EXT = /\.(txt|epub)$/i;
 
+// 单文件在队列中的状态
+type FileStatus = "pending" | "uploading" | "done" | "error";
+interface QueuedFile {
+  id: string;
+  file: File;
+  status: FileStatus;
+  result?: BookInfo | null;
+  error?: string;
+}
+
 export function ImportBookSheet({
   open,
   onClose,
@@ -45,61 +55,108 @@ export function ImportBookSheet({
   const reduced = useReducedMotion();
   const inputRef = React.useRef<HTMLInputElement>(null);
 
-  const [file, setFile] = React.useState<File | null>(null);
+  const [queue, setQueue] = React.useState<QueuedFile[]>([]);
   const [dragging, setDragging] = React.useState(false);
+  // 预览始终针对“当前查看”的那本（队列里第一本待处理）
+  const [activeId, setActiveId] = React.useState<string | null>(null);
   const [preview, setPreview] = React.useState<ImportBookPreview | null>(null);
   const [previewLoading, setPreviewLoading] = React.useState(false);
+  const [previewNonce, setPreviewNonce] = React.useState(0);
   const [previewError, setPreviewError] = React.useState<string | null>(null);
   const [expandToc, setExpandToc] = React.useState(false);
   const [uploading, setUploading] = React.useState(false);
-  const [importedBook, setImportedBook] = React.useState<BookInfo | null>(null);
+  const [importedBooks, setImportedBooks] = React.useState<BookInfo[]>([]);
 
-  const runPreview = React.useCallback(async (target: File) => {
-    setFile(target);
-    setPreview(null);
-    setPreviewError(null);
-    setExpandToc(false);
-    setImportedBook(null);
-    setPreviewLoading(true);
-    try {
-      // 大文件（>10MB）预览易超时：按文件大小动态给超时（基础 120s，每 10MB +30s，上限 600s）
-      const ms = Math.min(600_000, 120_000 + Math.max(0, target.size - 10 * 1024 * 1024) / (10 * 1024 * 1024) * 30_000);
-      const res = await booksApi.previewLocalBook(target, ms);
-      setPreview(res);
-    } catch (err) {
-      setPreviewError(err instanceof Error ? err.message : "文件解析失败，请检查文件编码或格式");
-    } finally {
-      setPreviewLoading(false);
-    }
-  }, []);
-
-  const handleSelectFile = React.useCallback(
-    (incoming: File | null | undefined) => {
-      if (!incoming) return;
-      if (!ACCEPTED_EXT.test(incoming.name)) {
-        notify.error("仅支持导入 .txt 或 .epub 格式的电子书");
-        return;
-      }
-      void runPreview(incoming);
-    },
-    [runPreview],
+  const activeFile = React.useMemo(
+    () => queue.find((q) => q.id === activeId) ?? null,
+    [queue, activeId],
   );
 
+  // 把一批文件加入队列（自动去重 + 只留 .txt/.epub）
+  const enqueueFiles = React.useCallback((incoming: File[] | FileList | null | undefined) => {
+    if (!incoming) return;
+    const files = Array.from(incoming);
+    if (files.length === 0) return;
+    const valid: File[] = [];
+    let rejected = 0;
+    for (const f of files) {
+      if (ACCEPTED_EXT.test(f.name)) valid.push(f);
+      else rejected++;
+    }
+    if (rejected > 0) notify.error(`忽略 ${rejected} 个非 .txt/.epub 文件`);
+    if (valid.length === 0) return;
+    setQueue((prev) => {
+      const existing = new Set(prev.map((q) => q.file.name));
+      const fresh = valid
+        .filter((f) => !existing.has(f.name))
+        .map((f) => ({
+          id: `${f.name}-${f.size}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          file: f,
+          status: "pending" as FileStatus,
+        }));
+      return fresh.length > 0 ? [...prev, ...fresh] : prev;
+    });
+  }, []);
+
+  // 外部传入的初始文件（例如从其他入口带过来的单本）也走队列
   React.useEffect(() => {
     if (!open) return;
-    if (initialFile) {
-      handleSelectFile(initialFile);
+    if (initialFile) enqueueFiles([initialFile]);
+  }, [open, initialFile, enqueueFiles]);
+
+  // 队列变化时，若 activeId 失效或尚未设，选第一本待处理并预览
+  React.useEffect(() => {
+    if (queue.length === 0) {
+      setActiveId(null);
+      setPreview(null);
+      setPreviewError(null);
+      return;
     }
-  }, [open, initialFile, handleSelectFile]);
+    if (!activeId || !queue.some((q) => q.id === activeId)) {
+      const first = queue.find((q) => q.status !== "done") ?? queue[0];
+      setActiveId(first.id);
+    }
+  }, [queue, activeId]);
+
+  // 预览“当前查看”那本
+  React.useEffect(() => {
+    const target = activeFile?.file;
+    if (!target) {
+      setPreview(null);
+      setPreviewError(null);
+      return;
+    }
+    let cancelled = false;
+    const run = async () => {
+      setPreview(null);
+      setPreviewError(null);
+      setExpandToc(false);
+      setPreviewLoading(true);
+      try {
+        const ms = Math.min(600_000, 120_000 + Math.max(0, target.size - 10 * 1024 * 1024) / (10 * 1024 * 1024) * 30_000);
+        const res = await booksApi.previewLocalBook(target, ms);
+        if (!cancelled) setPreview(res);
+      } catch (err) {
+        if (!cancelled) setPreviewError(err instanceof Error ? err.message : "文件解析失败，请检查文件编码或格式");
+      } finally {
+        if (!cancelled) setPreviewLoading(false);
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeFile, previewNonce]);
 
   const resetAll = React.useCallback(() => {
-    setFile(null);
+    setQueue([]);
+    setActiveId(null);
     setPreview(null);
     setPreviewError(null);
     setExpandToc(false);
     setPreviewLoading(false);
     setUploading(false);
-    setImportedBook(null);
+    setImportedBooks([]);
     if (inputRef.current) inputRef.current.value = "";
   }, []);
 
@@ -108,23 +165,39 @@ export function ImportBookSheet({
     onClose();
   };
 
-  const handleUpload = async () => {
-    if (!file) return;
+  const removeFile = (id: string) => {
+    setQueue((prev) => prev.filter((q) => q.id !== id));
+    if (activeId === id) setActiveId(null);
+  };
+
+  // 顺序导入队列里所有“未完成”的文件（逐个上传，失败不阻断后续）
+  const handleUploadAll = async () => {
+    if (queue.length === 0 || uploading) return;
     setUploading(true);
-    try {
-      const saved = await booksApi.uploadLocalBook(file);
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["shelf"] }),
-        queryClient.invalidateQueries({ queryKey: ["groups"] }),
-      ]);
-      setImportedBook(saved);
-      notify.success(`已将《${saved.name}》收入书房`);
-      onImported?.(saved);
-    } catch (err) {
-      notify.error(err instanceof Error ? err.message : "上传导入失败");
-    } finally {
-      setUploading(false);
+    const importable = queue.filter((q) => q.status !== "done");
+    let okCount = 0;
+    let failCount = 0;
+    for (const item of importable) {
+      setQueue((prev) => prev.map((q) => (q.id === item.id ? { ...q, status: "uploading" } : q)));
+      try {
+        const saved = await booksApi.uploadLocalBook(item.file);
+        setQueue((prev) => prev.map((q) => (q.id === item.id ? { ...q, status: "done", result: saved } : q)));
+        setImportedBooks((prev) => [...prev, saved]);
+        onImported?.(saved);
+        okCount++;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "上传失败";
+        setQueue((prev) => prev.map((q) => (q.id === item.id ? { ...q, status: "error", error: msg } : q)));
+        failCount++;
+      }
     }
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["shelf"] }),
+      queryClient.invalidateQueries({ queryKey: ["groups"] }),
+    ]);
+    setUploading(false);
+    if (okCount > 0) notify.success(`已导入 ${okCount} 本书到书房`);
+    if (failCount > 0) notify.error(`${failCount} 本书导入失败，可重新点“全部导入”重试`);
   };
 
   const allPreviewTitles = React.useMemo(() => {
@@ -147,7 +220,13 @@ export function ImportBookSheet({
   const previewTitles = expandToc ? allPreviewTitles : allPreviewTitles.slice(0, 12);
   const previewIntro = React.useMemo(() => cleanIntro(preview?.book?.intro), [preview]);
 
-  const stageKey = importedBook ? "imported" : !file ? "dropzone" : "preview";
+  // 预览针对“当前查看”那本（activeFile）
+  const hasQueue = queue.length > 0;
+  const pendingCount = queue.filter((q) => q.status !== "done").length;
+  const doneCount = queue.filter((q) => q.status === "done").length;
+  const allDone = hasQueue && pendingCount === 0;
+
+  const stageKey = allDone ? "imported" : hasQueue ? "preview" : "dropzone";
 
   return (
     <Sheet
@@ -157,19 +236,19 @@ export function ImportBookSheet({
       title="导入本地书籍"
       subtitle="支持 TXT / EPUB，自动解析书目信息与章节结构"
       footer={
-        importedBook ? (
+        allDone && importedBooks.length > 0 ? (
           <div className="flex items-center justify-end gap-2">
-            <Button variant="ghost" size="sm" onClick={resetAll}>
+            <Button variant="ghost" size="sm" onClick={() => setImportedBooks([])}>
               继续导入
             </Button>
             <Button
               variant="primary"
               size="sm"
               onClick={() => {
-                const targetUrl = importedBook.bookUrl;
+                const last = importedBooks[importedBooks.length - 1];
                 handleClose();
                 requestKeepScreenAwakeNow();
-                navigate(buildReaderUrl(targetUrl, 0));
+                navigate(buildReaderUrl(last.bookUrl, 0));
               }}
             >
               <BookOpen className="size-3.5" />
@@ -179,7 +258,7 @@ export function ImportBookSheet({
         ) : (
           <div className="flex items-center justify-between gap-2">
             <span className="min-w-0 truncate text-[11px] text-ink-muted tabular-nums">
-              {file ? `${file.name} · ${formatBytes(file.size)}` : "未选择文件"}
+              {hasQueue ? `已选 ${queue.length} 本${doneCount > 0 ? `，已导入 ${doneCount}` : ""}` : "未选择文件"}
             </span>
             <div className="flex shrink-0 items-center gap-2">
               <Button variant="ghost" size="sm" onClick={handleClose}>
@@ -189,11 +268,11 @@ export function ImportBookSheet({
                 variant="primary"
                 size="sm"
                 loading={uploading}
-                disabled={!file || previewLoading}
-                onClick={handleUpload}
+                disabled={!hasQueue || uploading}
+                onClick={() => void handleUploadAll()}
               >
                 <Upload className="size-3.5" />
-                收入书房
+                {uploading ? `导入中…` : hasQueue ? `全部导入 ${queue.length} 本` : "收入书房"}
               </Button>
             </div>
           </div>
@@ -204,23 +283,23 @@ export function ImportBookSheet({
         ref={inputRef}
         type="file"
         accept=".txt,.epub,text/plain,application/epub+zip"
+        multiple
         className="hidden"
         onChange={(e) => {
-          const picked = e.target.files?.[0];
-          if (picked) handleSelectFile(picked);
+          enqueueFiles(e.target.files);
           e.currentTarget.value = "";
         }}
       />
 
       <AnimatePresence mode="wait" initial={false}>
-        {stageKey === "imported" && importedBook ? (
+        {stageKey === "imported" && importedBooks.length > 0 ? (
           <motion.div
             key="imported"
             initial={reduced ? { opacity: 0 } : { opacity: 0, scale: 0.96 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0 }}
             transition={SPRING_POP}
-            className="flex flex-col items-center gap-4 py-8 text-center"
+            className="flex flex-col items-center gap-4 py-6 text-center"
           >
             <motion.div
               initial={reduced ? undefined : { scale: 0.7 }}
@@ -232,20 +311,34 @@ export function ImportBookSheet({
             </motion.div>
             <div className="space-y-1">
               <h3 className="font-serif text-lg font-semibold text-ink">
-                《{importedBook.name}》已收入书房
+                已导入 {importedBooks.length} 本书到书房
               </h3>
-              <p className="text-xs text-ink-muted">
-                {importedBook.author || "佚名"} · 本地书库已完成建档，可即刻展卷阅读。
-              </p>
+              <p className="text-xs text-ink-muted">本地书库已完成建档，可即刻展卷阅读。</p>
             </div>
-            <BookCover
-              src={importedBook.coverUrl}
-              title={importedBook.name}
-              author={importedBook.author}
-              pageEdges
-              interactive={false}
-              className="mt-1 w-24"
-            />
+            <div className="w-full max-w-sm space-y-1.5">
+              {importedBooks.map((b) => (
+                <button
+                  key={b.bookUrl}
+                  type="button"
+                  onClick={() => {
+                    requestKeepScreenAwakeNow();
+                    navigate(buildReaderUrl(b.bookUrl, 0));
+                  }}
+                  className="flex w-full items-center gap-2 rounded-xl border border-line bg-elevated/70 px-3 py-2 text-left transition-colors hover:border-accent/55 hover:bg-accent-soft/40"
+                >
+                  <BookCover
+                    src={b.coverUrl}
+                    title={b.name}
+                    author={b.author}
+                    pageEdges
+                    interactive={false}
+                    className="w-8 shrink-0"
+                  />
+                  <span className="min-w-0 flex-1 truncate text-xs font-medium text-ink">{b.name}</span>
+                  <span className="shrink-0 text-[10px] text-ink-muted">{b.author || "佚名"} →</span>
+                </button>
+              ))}
+            </div>
           </motion.div>
         ) : stageKey === "dropzone" ? (
           <motion.div
@@ -277,8 +370,7 @@ export function ImportBookSheet({
                 e.preventDefault();
                 e.stopPropagation();
                 setDragging(false);
-                const dropped = e.dataTransfer.files?.[0];
-                if (dropped) handleSelectFile(dropped);
+                enqueueFiles(e.dataTransfer.files);
               }}
               className={cn(
                 "group relative flex cursor-pointer flex-col items-center justify-center gap-4 overflow-hidden rounded-3xl border-2 border-dashed px-6 py-14 text-center transition-all",
@@ -316,7 +408,7 @@ export function ImportBookSheet({
               </Button>
             </div>
           </motion.div>
-        ) : file ? (
+        ) : hasQueue ? (
           <motion.div
             key="preview"
             initial={reduced ? { opacity: 0 } : { opacity: 0, y: 6 }}
@@ -335,49 +427,80 @@ export function ImportBookSheet({
               e.preventDefault();
               e.stopPropagation();
               setDragging(false);
-              const dropped = e.dataTransfer.files?.[0];
-              if (dropped) handleSelectFile(dropped);
+              enqueueFiles(e.dataTransfer.files);
             }}
             className={cn(
               "space-y-5 rounded-2xl transition-all",
               dragging && "ring-2 ring-accent/50 ring-offset-4 ring-offset-bg",
             )}
           >
-            {/* Selected file strip */}
-            <div className="flex items-center justify-between gap-3 rounded-2xl border border-line bg-subtle/55 px-3.5 py-2.5">
-              <div className="flex min-w-0 items-center gap-2.5">
-                <div className="flex size-8 shrink-0 items-center justify-center rounded-xl bg-elevated text-accent shadow-[var(--shadow-sm)]">
-                  <FileText className="size-4" />
-                </div>
-                <div className="min-w-0">
-                  <p className="truncate text-[13px] font-medium text-ink">{file.name}</p>
-                  <p className="text-[11px] text-ink-muted tabular-nums">
-                    {formatBytes(file.size)} · 可直接拖入新文件替换
-                  </p>
+            {/* 队列列表（多本） */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <h4 className="font-serif text-xs font-semibold tracking-wide text-ink-secondary">
+                  待导入队列（{queue.length}）
+                </h4>
+                <div className="flex items-center gap-1">
+                  <Button size="xs" variant="ghost" onClick={() => inputRef.current?.click()}>
+                    添加文件
+                  </Button>
+                  <IconButton size="sm" aria-label="清空队列" onClick={resetAll}>
+                    <X className="size-3.5" />
+                  </IconButton>
                 </div>
               </div>
-              <div className="flex shrink-0 items-center gap-1">
-                <Button
-                  size="xs"
-                  variant="ghost"
-                  onClick={() => inputRef.current?.click()}
-                >
-                  换文件
-                </Button>
-                <IconButton
-                  size="sm"
-                  aria-label="清除所选文件"
-                  onClick={resetAll}
-                >
-                  <X className="size-3.5" />
-                </IconButton>
+              <div className="max-h-40 space-y-1 overflow-y-auto pr-1">
+                {queue.map((q) => (
+                  <div
+                    key={q.id}
+                    onClick={() => setActiveId(q.id)}
+                    className={cn(
+                      "flex cursor-pointer items-center gap-2.5 rounded-xl border px-2.5 py-2 transition-colors",
+                      activeId === q.id ? "border-accent/55 bg-accent-soft/40" : "border-line bg-elevated/55 hover:bg-subtle/50",
+                    )}
+                  >
+                    <div
+                      className={cn(
+                        "flex size-7 shrink-0 items-center justify-center rounded-lg",
+                        q.status === "done" ? "bg-success-soft text-success" : q.status === "error" ? "bg-danger-soft text-danger" : "bg-subtle text-accent",
+                      )}
+                    >
+                      {q.status === "done" ? (
+                        <CheckCircle2 className="size-4" />
+                      ) : q.status === "error" ? (
+                        <AlertCircle className="size-4" />
+                      ) : (
+                        <FileText className="size-4" />
+                      )}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-[13px] font-medium text-ink">{q.file.name}</p>
+                      <p className="text-[11px] text-ink-muted tabular-nums">
+                        {formatBytes(q.file.size)}
+                        {q.status === "error" ? ` · ${q.error}` : q.status === "uploading" ? " · 导入中…" : q.status === "done" ? " · 已导入" : ""}
+                      </p>
+                    </div>
+                    {q.status !== "done" && q.status !== "uploading" && (
+                      <IconButton
+                        size="sm"
+                        aria-label="移除"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          removeFile(q.id);
+                        }}
+                      >
+                        <X className="size-3.5" />
+                      </IconButton>
+                    )}
+                  </div>
+                ))}
               </div>
             </div>
 
             {/* Preview Content */}
-            {file.size > 20 * 1024 * 1024 && !preview ? (
+            {activeFile && activeFile.file.size > 20 * 1024 * 1024 && !preview ? (
               <div className="rounded-xl border border-warning/30 bg-warning/10 px-3 py-2 text-[11px] text-ink-muted">
-                文件较大（{formatBytes(file.size)}），目录预览可能超时——可直接点右下角「收入书房」上传，上传成功后目录会自动解析
+                文件较大（{formatBytes(activeFile.file.size)}），目录预览可能超时——可直接点右下角「全部导入」上传，上传成功后目录会自动解析
               </div>
             ) : null}
             {previewLoading ? (
@@ -398,7 +521,7 @@ export function ImportBookSheet({
                   <Button
                     size="xs"
                     variant="secondary"
-                    onClick={() => void runPreview(file)}
+                    onClick={() => setPreviewNonce((n) => n + 1)}
                   >
                     <RefreshCw className="size-3" />
                     重新解析
@@ -432,7 +555,7 @@ export function ImportBookSheet({
                         {(preview.format || "TXT").toUpperCase()}
                       </Badge>
                       <Badge tone="success">共 {preview.chapterCount} 章</Badge>
-                      <Badge>{formatBytes(file.size)}</Badge>
+                      <Badge>{formatBytes(activeFile?.file.size ?? 0)}</Badge>
                     </div>
                     {previewIntro ? (
                       <p className="line-clamp-2 pt-0.5 text-[11.5px] leading-relaxed text-ink-muted">
