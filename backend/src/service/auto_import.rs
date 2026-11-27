@@ -219,6 +219,7 @@ async fn check_and_delete_invalid(
     let sources: Vec<crate::model::BookSource> =
         storage.get_book_sources(ns).await?.into_iter().filter(|s| s.enabled).collect();
     let total = sources.len();
+    tracing::debug!("check_and_delete_invalid [{ns}] 启用源总数: {total}");
     let concurrency: usize = std::env::var("READER_CHECK_SOURCES_CONCURRENCY")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())

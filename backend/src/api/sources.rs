@@ -86,6 +86,21 @@ pub async fn get_book_sources(
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(0)
         > 0;
+    let paged = params
+        .get("paged")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0)
+        > 0;
+    let page = params
+        .get("page")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let page_size = params
+        .get("pageSize")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 500);
     let published: HashSet<String> = sqlx::query_scalar(
         "SELECT book_source_url FROM book_sources WHERE user_namespace = 'default'",
     )
@@ -94,6 +109,39 @@ pub async fn get_book_sources(
     .unwrap_or_default()
     .into_iter()
     .collect();
+    // 分页模式：仅返回当前页 + 总数（大幅降低大书源库响应体积）
+    if paged {
+        let offset = (page - 1) * page_size;
+        match state
+            .storage
+            .get_book_sources_paged(&namespace, page_size, offset)
+            .await
+        {
+            Ok((sources, total)) => {
+                let out: Vec<FullBookSourceItem> = sources
+                    .into_iter()
+                    .map(|source| {
+                        let is_public = published.contains(&source.book_source_url);
+                        FullBookSourceItem {
+                            source,
+                            published: is_public,
+                        }
+                    })
+                    .collect();
+                let payload = PagedBookSources {
+                    list: out,
+                    total,
+                    page: page as u32,
+                    pageSize: page_size as u32,
+                };
+                ReturnData::ok_typed(payload).into_response()
+            }
+            Err(e) => {
+                tracing::error!("getBookSources [paged {namespace}] 失败: {e}");
+                Json(ReturnData::err("系统错误")).into_response()
+            }
+        }
+    } else {
     match state.storage.get_book_sources(&namespace).await {
         Ok(sources) => {
             if simple {
@@ -131,6 +179,21 @@ pub async fn get_book_sources(
             Json(ReturnData::err("系统错误")).into_response()
         }
     }
+    }
+    // paged 分支的 else 闭合
+}
+
+/// 分页书源列表载荷（paged=1 时 data 字段）
+#[derive(serde::Serialize)]
+struct PagedBookSources {
+    #[serde(rename = "list")]
+    list: Vec<FullBookSourceItem>,
+    #[serde(rename = "total")]
+    total: usize,
+    #[serde(rename = "page")]
+    page: u32,
+    #[serde(rename = "pageSize")]
+    pageSize: u32,
 }
 
 /// GET/POST `/reader3/getBookSource`：单个书源

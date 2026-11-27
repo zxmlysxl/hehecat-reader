@@ -10,6 +10,7 @@ import type {
   Bookmark,
   BookSource,
   BookSourceLite,
+  PagedBookSources,
   CacheInfo,
   CacheProgress,
   CustomFont,
@@ -235,6 +236,12 @@ export const booksApi = {
 export const sourcesApi = {
   list: () => apiGet<BookSource[]>("/reader3/getBookSources"),
   listLite: () => apiGet<BookSourceLite[]>("/reader3/getBookSources", { simple: 1 }),
+  listPaged: (page: number, pageSize: number) =>
+    apiGet<PagedBookSources>("/reader3/getBookSources", {
+      paged: 1,
+      page,
+      pageSize,
+    }),
   get: (bookSourceUrl: string) =>
     apiPost<BookSource>("/reader3/getBookSource", { bookSourceUrl }),
   save: (source: Partial<BookSource> & { bookSourceUrl: string }) =>

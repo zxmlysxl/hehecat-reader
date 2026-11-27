@@ -210,6 +210,13 @@ export interface BookSourceLite {
   published?: boolean;
 }
 
+export interface PagedBookSources {
+  list: BookSource[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
 export interface BookSource extends BookSourceLite {
   bookUrlPattern?: string | null;
   customOrder: number;

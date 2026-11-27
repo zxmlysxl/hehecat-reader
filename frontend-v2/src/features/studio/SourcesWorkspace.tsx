@@ -36,6 +36,7 @@ import { resolveImageUrl } from "@/api/client";
 import { discoverApi, sourcesApi } from "@/api/endpoints";
 import type {
   BookSource,
+  PagedBookSources,
   InvalidBookSource,
   SearchBook,
   SourceCookie,
@@ -445,10 +446,14 @@ export default function SourcesWorkspace() {
     page,
   ]);
 
+  // 无过滤（默认）时走服务端分页，大书源库只拉当前页，避免 65MB 全量导致偶发空/卡
+  const filteringActive =
+    keyword.trim() !== "" || statusFilter !== "all" || activeGroup !== "__ALL__";
   // Parallel data queries
   const sourcesQuery = useQuery({
-    queryKey: ["studio", "sources"],
-    queryFn: () => sourcesApi.list(),
+    queryKey: ["studio", "sources", filteringActive, page, pageSize],
+    queryFn: async (): Promise<BookSource[] | PagedBookSources> =>
+      filteringActive ? sourcesApi.list() : sourcesApi.listPaged(page, pageSize),
   });
   const statsQuery = useQuery({
     queryKey: ["studio", "sourceStats"],
@@ -463,7 +468,19 @@ export default function SourcesWorkspace() {
     queryFn: () => sourcesApi.getCookies(),
   });
 
-  const sources = React.useMemo(() => sourcesQuery.data ?? [], [sourcesQuery.data]);
+  const paged = !filteringActive; // 默认服务端分页模式
+  const sources = React.useMemo(() => {
+    if (paged && sourcesQuery.data && Array.isArray((sourcesQuery.data as PagedBookSources).list)) {
+      return (sourcesQuery.data as PagedBookSources).list;
+    }
+    return (sourcesQuery.data as BookSource[]) ?? [];
+  }, [sourcesQuery.data, paged]);
+  const totalSources = React.useMemo(() => {
+    if (paged && sourcesQuery.data && Array.isArray((sourcesQuery.data as PagedBookSources).list)) {
+      return (sourcesQuery.data as PagedBookSources).total;
+    }
+    return sources.length;
+  }, [sourcesQuery.data, paged, sources]);
 
   const statMap = React.useMemo(() => {
     const map = new Map<string, SourceStat>();
@@ -715,12 +732,15 @@ export default function SourcesWorkspace() {
     setPage(1);
   }, [keyword, statusFilter, activeGroup, sortByConfidence]);
 
-  const pageCount = Math.max(1, Math.ceil(filteredSources.length / pageSize));
+  // 分页：默认（无过滤）服务端分页，页码总数用服务端 total；有过滤时用客户端 filteredSources
+  const effectiveTotal = paged ? totalSources : filteredSources.length;
+  const pageCount = Math.max(1, Math.ceil(effectiveTotal / pageSize));
   const safePage = Math.min(Math.max(1, page), pageCount);
   const pageStart = (safePage - 1) * pageSize;
   const pagedSources = React.useMemo(
-    () => filteredSources.slice(pageStart, pageStart + pageSize),
-    [filteredSources, pageStart, pageSize],
+    () =>
+      paged ? sources : filteredSources.slice(pageStart, pageStart + pageSize),
+    [paged, sources, filteredSources, pageStart, pageSize],
   );
   const pageTokens = React.useMemo(
     () => buildPageNumbers(safePage, pageCount),

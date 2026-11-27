@@ -228,6 +228,30 @@ impl Storage {
         Ok((*entry.list).clone())
     }
 
+    /// 书源列表分页版：返回 (当前页书源, 总数)。
+    /// 从内存缓存切片，仅克隆本页 item（O(page)），适合大书源库降低响应体积。
+    /// limit <= 0 视为不限（返回全部）。
+    pub async fn get_book_sources_paged(
+        &self,
+        ns: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<crate::model::BookSource>, usize)> {
+        let entry = self.load_book_sources_entry(ns).await?;
+        let list = &*entry.list;
+        let total = list.len();
+        let offset = offset.max(0) as usize;
+        let end = if limit <= 0 {
+            total
+        } else {
+            offset.saturating_add(limit as usize).min(total)
+        };
+        let start = offset.min(end);
+        let page: Vec<crate::model::BookSource> =
+            list.get(start..end).unwrap_or_default().to_vec();
+        Ok((page, total))
+    }
+
     /// 书源使用统计自增
     pub async fn bump_book_source_use(&self, ns: &str, url: &str) -> Result<()> {
         sqlx::query(
