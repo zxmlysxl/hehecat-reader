@@ -321,6 +321,10 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
             get(auto_import::auto_import_preview).post(auto_import::auto_import_preview),
         )
         .route(
+            "/reader3/autoImportScan",
+            get(auto_import::auto_import_scan).post(auto_import::auto_import_scan),
+        )
+        .route(
             "/reader3/autoImportConfig",
             post(auto_import::auto_import_save_config),
         )

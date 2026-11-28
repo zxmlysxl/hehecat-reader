@@ -23,8 +23,11 @@ pub const DEFAULT_LIST_URL: &str = "https://www.yckceo.com/yuedu/shuyuans/index.
 /// 单次最多扫描的列表页数（翻页找新条目）
 const MAX_LIST_PAGES: usize = 5;
 
-/// 单次最多导入的合集条目数（防止一次性灌入过多）
-const MAX_IMPORT_PER_RUN: usize = 10_000; // 允许导多少导多少，只设上限防止无限增长
+/// 单次最多导入的合集条目数（返回流程的默认页大小；后台任务分批直到导完）
+const MAX_IMPORT_PER_RUN: usize = 5;
+
+/// 后台任务单次运行的最长占用时间（留足余量给 web 请求层）
+const BACKGROUND_BUDGET_SECS: u64 = 20 * 60;
 
 /// 合集详情页 → json 订阅地址
 /// 兼容两种格式：
@@ -71,6 +74,12 @@ pub struct AutoImportConfig {
     pub last_result: String,
     /// 上次导入的书源条数
     pub last_imported_count: i64,
+    /// 后台任务状态："" | "running" | "done" | "error"
+    #[serde(default)]
+    pub task_state: String,
+    /// 后台任务进度描述
+    #[serde(default)]
+    pub task_progress: String,
 }
 
 impl Default for AutoImportConfig {
@@ -86,6 +95,8 @@ impl Default for AutoImportConfig {
             last_run_at: 0,
             last_result: String::new(),
             last_imported_count: 0,
+            task_state: String::new(),
+            task_progress: String::new(),
         }
     }
 }
@@ -258,6 +269,16 @@ async fn check_and_delete_invalid(
 
 /// 执行一次自动导入
 pub async fn run_once(storage: &Storage, ns: &str, cfg: &mut AutoImportConfig) -> Result<RunResult> {
+    run_with_limit(storage, ns, cfg, MAX_IMPORT_PER_RUN).await
+}
+
+/// 执行一次自动导入（带条目上限）
+pub async fn run_with_limit(
+    storage: &Storage,
+    ns: &str,
+    cfg: &mut AutoImportConfig,
+    limit: usize,
+) -> Result<RunResult> {
     let ids = scan_entry_ids(&cfg.list_url).await?;
     let scanned = ids.len();
     let mut details: Vec<String> = Vec::new();
@@ -265,8 +286,8 @@ pub async fn run_once(storage: &Storage, ns: &str, cfg: &mut AutoImportConfig) -
     // 只处理比 last_id 大的条目（增量）
     let mut pending: Vec<i64> = ids.into_iter().filter(|id| *id > cfg.last_id).collect();
     let max_new = pending.len();
-    if pending.len() > MAX_IMPORT_PER_RUN {
-        pending.truncate(MAX_IMPORT_PER_RUN);
+    if pending.len() > limit {
+        pending.truncate(limit);
     }
 
     let mut imported_entries = 0usize;
@@ -337,8 +358,13 @@ pub async fn run_once(storage: &Storage, ns: &str, cfg: &mut AutoImportConfig) -
         if max_new == 0 {
             "无新增条目".to_string()
         } else {
-            format!("{max_new} 个新条目均导入失败")
+            format!("{max_new} 个新条目本次均未导入成功")
         }
+    } else if max_new > limit {
+        format!(
+            "导入 {imported_entries} 个合集 / {imported_sources} 个书源（还有 {} 个待导入）",
+            max_new - imported_entries
+        )
     } else {
         format!("导入 {imported_entries} 个合集 / {imported_sources} 个书源")
     };
@@ -445,4 +471,99 @@ pub fn spawn_auto_import_job(storage: Storage) {
             }
         }
     });
+}
+
+/// 正在跑后台任务的命名空间（防止重复触发）
+static RUNNING: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn running_set() -> &'static parking_lot::Mutex<std::collections::HashSet<String>> {
+    RUNNING.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// 查询某命名空间是否正在跑后台导入
+pub fn is_running(ns: &str) -> bool {
+    running_set().lock().contains(ns)
+}
+
+/// 后台分批导入：立即返回，任务在 tokio 里继续跑，进度写入 cfg(task_state/task_progress)
+/// `force_full` 为 true 时把游标归零（全量重扫）
+pub fn spawn_background_import(storage: Storage, ns: String, force_full: bool) -> bool {
+    {
+        let mut set = running_set().lock();
+        if set.contains(&ns) {
+            return false; // 已有任务在跑
+        }
+        set.insert(ns.clone());
+    }
+
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let mut cfg = load_config(&storage, &ns).await;
+        if force_full {
+            cfg.last_id = 0;
+        }
+        cfg.task_state = "running".to_string();
+        cfg.task_progress = "正在扫描列表页…".to_string();
+        let _ = save_config(&storage, &ns, &cfg).await;
+
+        let mut total_entries = 0usize;
+        let mut total_sources = 0usize;
+        let mut rounds = 0usize;
+        let mut last_error: Option<String> = None;
+
+        loop {
+            rounds += 1;
+            let mut c = load_config(&storage, &ns).await;
+            match run_with_limit(&storage, &ns, &mut c, MAX_IMPORT_PER_RUN).await {
+                Ok(r) => {
+                    total_entries += r.imported_entries;
+                    total_sources += r.imported_sources;
+
+                    c.task_state = "running".to_string();
+                    c.task_progress = format!(
+                        "已导入 {total_entries} 个合集 / {total_sources} 个书源（第 {rounds} 轮）"
+                    );
+                    let _ = save_config(&storage, &ns, &c).await;
+
+                    // 本轮没有导入任何新条目 → 导完了或全部失败，收工
+                    if r.imported_entries == 0 {
+                        break;
+                    }
+                    if started.elapsed().as_secs() > BACKGROUND_BUDGET_SECS {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    last_error = Some(format!("{e:#}"));
+                    break;
+                }
+            }
+        }
+
+        let mut final_cfg = load_config(&storage, &ns).await;
+        final_cfg.task_state = if last_error.is_some() { "error" } else { "done" }.to_string();
+        final_cfg.task_progress = match &last_error {
+            Some(e) => format!("失败: {e}"),
+            None => {
+                if total_entries == 0 {
+                    "无新增条目".to_string()
+                } else {
+                    format!("完成：导入 {total_entries} 个合集 / {total_sources} 个书源")
+                }
+            }
+        };
+        let _ = save_config(&storage, &ns, &final_cfg).await;
+
+        running_set().lock().remove(&ns);
+        tracing::info!(
+            "后台自动导入 [{}] 结束: {} 个合集 / {} 个书源，{} 轮",
+            ns,
+            total_entries,
+            total_sources,
+            rounds
+        );
+    });
+
+    true
 }

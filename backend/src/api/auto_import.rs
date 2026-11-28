@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use super::auth::{check_manager_auth, resolve_namespace};
 use super::router::{AppState, ReturnData};
 
-/// 预览：抓取当前列表页 + 找出待导入的新条目（只预览不写入）
+/// 读取配置（轻量，不扫网络，立即返回）
 /// POST /reader3/autoImportPreview
 pub async fn auto_import_preview(
     State(state): State<AppState>,
@@ -29,44 +29,17 @@ pub async fn auto_import_preview(
     }
 
     let cfg = crate::service::auto_import::load_config(&state.storage, &namespace).await;
+    Json(ReturnData::ok(config_payload(&cfg, &namespace))).into_response()
+}
 
-    // 预览：扫描待导入的条目（只看不写）
-    let pending_ids = match crate::service::auto_import::scan_pending_async(&cfg).await {
-        Ok(ids) => ids,
-        Err(e) => {
-            return axum::Json(ReturnData::err(&format!("预览失败: {e:#}"))).into_response();
-        }
-    };
-    let total_entries = pending_ids.len();
-
-    // 拉取详情页提取 json 地址（只取前 5 条做样例，避免预览耗时过长）
-    let mut preview: Vec<Value> = Vec::new();
-    for id in pending_ids.iter().take(5) {
-        let detail_url = crate::service::auto_import::derive_detail_url(&cfg.list_url, *id);
-        match crate::service::auto_import::resolve_json_url_public(&detail_url).await {
-            Ok(json_url) => {
-                preview.push(json!({
-                    "id": id,
-                    "detailUrl": detail_url,
-                    "jsonUrl": json_url,
-                }));
-            }
-            Err(e) => {
-                preview.push(json!({
-                    "id": id,
-                    "detailUrl": detail_url,
-                    "jsonUrl": null,
-                    "error": format!("{e:#}"),
-                }));
-            }
-        }
-    }
-
-    let payload = json!({
+/// 拼装配置响应体（无网络调用）
+fn config_payload(
+    cfg: &crate::service::auto_import::AutoImportConfig,
+    namespace: &str,
+) -> Value {
+    json!({
         "listUrl": cfg.list_url,
         "lastId": cfg.last_id,
-        "pendingCount": total_entries,
-        "preview": preview,
         "enabled": cfg.enabled,
         "scheduleType": match cfg.schedule_type {
             crate::service::auto_import::ScheduleType::Daily => "daily",
@@ -78,11 +51,41 @@ pub async fn auto_import_preview(
         "lastRunAt": cfg.last_run_at,
         "lastResult": cfg.last_result,
         "lastImportedCount": cfg.last_imported_count,
-    });
-    Json(ReturnData::ok(payload)).into_response()
+        // 后台任务状态（前端轮询用；不扫网络）
+        "taskState": cfg.task_state,
+        "taskProgress": cfg.task_progress,
+        "running": crate::service::auto_import::is_running(namespace),
+        "serverTime": chrono::Utc::now().timestamp_millis(),
+    })
 }
 
-/// 执行一次：按增量导入新条目
+/// 扫描待导入条目（会走网络，前端异步调用，不阻塞区块渲染）
+/// POST /reader3/autoImportScan
+pub async fn auto_import_scan(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    _body: Option<axum::body::Bytes>,
+) -> Response {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret).into_response(),
+    };
+    if let Err(ret) = check_manager_auth(&state, &params, &headers, None).await {
+        return Json(ret).into_response();
+    }
+    let cfg = crate::service::auto_import::load_config(&state.storage, &namespace).await;
+    match crate::service::auto_import::scan_pending_async(&cfg).await {
+        Ok(ids) => Json(ReturnData::ok(json!({
+            "pendingCount": ids.len(),
+            "ids": ids.iter().take(50).collect::<Vec<_>>(),
+        })))
+        .into_response(),
+        Err(e) => Json(ReturnData::err(&format!("扫描失败: {e:#}"))).into_response(),
+    }
+}
+
+/// 启动一次导入（后台异步执行，立即返回，轮询 /autoImportPreview 看进度）
 /// POST /reader3/autoImportRun
 /// body: { "forceFullScan"?: bool }
 pub async fn auto_import_run(
@@ -102,38 +105,29 @@ pub async fn auto_import_run(
         return Json(ret).into_response();
     }
 
-    let mut cfg = crate::service::auto_import::load_config(&state.storage, &namespace).await;
     let force = body_json
         .as_ref()
         .and_then(|v| v.get("forceFullScan"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if force {
-        cfg.last_id = 0;
+
+    let started =
+        crate::service::auto_import::spawn_background_import(state.storage.clone(), namespace.clone(), force);
+    if !started {
+        return Json(ReturnData::ok(json!({
+            "started": false,
+            "running": true,
+            "message": "已有导入任务在运行中",
+        })))
+        .into_response();
     }
 
-    match crate::service::auto_import::run_once(&state.storage, &namespace, &mut cfg).await {
-        Ok(result) => {
-            let _ =
-                crate::service::auto_import::save_config(&state.storage, &namespace, &cfg).await;
-            let payload = json!({
-                "scanned": result.scanned,
-                "importedEntries": result.imported_entries,
-                "importedSources": result.imported_sources,
-                "lastId": result.last_id,
-                "deletedInvalid": result.deleted_invalid,
-                "details": result.details,
-            });
-            Json(ReturnData::ok(payload)).into_response()
-        }
-        Err(e) => {
-            cfg.last_run_at = chrono::Utc::now().timestamp_millis();
-            cfg.last_result = format!("失败: {e:#}");
-            let _ =
-                crate::service::auto_import::save_config(&state.storage, &namespace, &cfg).await;
-            axum::Json(ReturnData::err(&format!("自动导入失败: {e:#}"))).into_response()
-        }
-    }
+    Json(ReturnData::ok(json!({
+        "started": true,
+        "running": true,
+        "message": "已在后台开始导入，可关闭页面，稍后回来查看结果",
+    })))
+    .into_response()
 }
 
 /// 保存配置
@@ -195,20 +189,5 @@ pub async fn auto_import_save_config(
         return axum::Json(ReturnData::err(&format!("保存失败: {e:#}"))).into_response();
     }
 
-    let payload = json!({
-        "enabled": cfg.enabled,
-        "scheduleType": match cfg.schedule_type {
-            crate::service::auto_import::ScheduleType::Daily => "daily",
-            crate::service::auto_import::ScheduleType::Weekly => "weekly",
-        },
-        "dailyTime": cfg.daily_time,
-        "weeklyDays": cfg.weekly_days,
-        "autoDeleteInvalid": cfg.auto_delete_invalid,
-        "listUrl": cfg.list_url,
-        "lastId": cfg.last_id,
-        "lastRunAt": cfg.last_run_at,
-        "lastResult": cfg.last_result,
-        "lastImportedCount": cfg.last_imported_count,
-    });
-    Json(ReturnData::ok(payload)).into_response()
+    Json(ReturnData::ok(config_payload(&cfg, &namespace))).into_response()
 }

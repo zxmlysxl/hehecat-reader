@@ -94,21 +94,29 @@ export interface AutoImportRunResult {
   details: string[];
 }
 
+export interface AutoImportStatus {
+  listUrl: string;
+  lastId: number;
+  enabled: boolean;
+  scheduleType: 'daily' | 'weekly';
+  dailyTime: string;
+  weeklyDays: number[];
+  autoDeleteInvalid: boolean;
+  lastRunAt: number;
+  lastResult: string;
+  lastImportedCount: number;
+  /** 后台任务状态：'' | 'running' | 'done' | 'error' */
+  taskState: string;
+  taskProgress: string;
+  running: boolean;
+  serverTime: number;
+}
+
 export const autoImportApi = {
-  preview: () => apiGet<{
-    listUrl: string;
-    lastId: number;
-    pendingCount: number;
-    preview: Array<{ id: number; detailUrl: string; jsonUrl: string | null; error?: string }>;
-    enabled: boolean;
-    scheduleType: 'daily' | 'weekly';
-    dailyTime: string;
-    weeklyDays: number[];
-    autoDeleteInvalid: boolean;
-    lastRunAt: number;
-    lastResult: string;
-    lastImportedCount: number;
-  }>("/reader3/autoImportPreview"),
+  /** 轻量读取配置，不扫网络，立即返回 */
+  status: () => apiPost<AutoImportStatus>("/reader3/autoImportPreview", {}),
+  /** 扫描待导入条目（走网络，异步调用不阻塞 UI） */
+  scan: () => apiPost<{ pendingCount: number; ids: number[] }>("/reader3/autoImportScan", {}),
   saveConfig: (body: {
     enabled?: boolean;
     scheduleType?: 'daily' | 'weekly';
@@ -117,8 +125,13 @@ export const autoImportApi = {
     autoDeleteInvalid?: boolean;
     listUrl?: string;
   }) => apiPost<AutoImportConfig>("/reader3/autoImportConfig", body),
+  /** 启动后台导入，立即返回；进度轮询 status() */
   run: (forceFullScan = false) =>
-    apiPost<AutoImportRunResult>("/reader3/autoImportRun", { forceFullScan }, { timeoutMs: 600_000 }),
+    apiPost<{ started: boolean; running: boolean; message: string }>(
+      "/reader3/autoImportRun",
+      { forceFullScan },
+      { timeoutMs: 30_000 },
+    ),
 };
 
 /* ---------- User config (reading prefs, persisted server-side) ---------- */

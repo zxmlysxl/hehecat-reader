@@ -8,7 +8,7 @@ import type { InvalidBookSource } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { notify } from "@/stores/toast";
 import { Button } from "@/ui/Button";
-import { Badge, Spinner, Switch } from "@/ui/Controls";
+import { Spinner, Switch } from "@/ui/Controls";
 import { Input } from "@/ui/Input";
 
 const WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"];
@@ -24,119 +24,195 @@ type AutoImportSettings = {
   lastRunAt: number;
   lastResult: string;
   lastImportedCount: number;
+  taskState: string;
+  taskProgress: string;
+  running: boolean;
 };
 
-type PreviewData = {
-  listUrl: string;
-  lastId: number;
-  pendingCount: number;
-  preview: Array<{ id: number; detailUrl: string; jsonUrl: string | null; error?: string }>;
-};
-
-// 模块级缓存：SPA 存活期间跨 mount 保留，重新进“用户管理”不重新拉网络（避免每次进页面都要加载）
-// 带 TTL（5 分钟），超过则后台静默刷新一次。
+// 模块级缓存：SPA 存活期间跨 mount 保留，配合 sessionStorage 实现"刷新即见"
+// 配置是轻量接口（不扫网络），所以刷新后 0.x 秒就能渲染出内容。
 type AutoImportCache = {
   config: AutoImportSettings | null;
-  preview: PreviewData | null;
+  pendingCount: number | null;
   invalidList: InvalidBookSource[];
   ts: number;
 };
 const CACHE_TTL_MS = 5 * 60 * 1000;
-let moduleCache: AutoImportCache | null = null;
-let prefetching: Promise<void> | null = null;
+const SS_KEY = "mojuan.autoImport.cache.v3";
 
-async function fetchAutoImport(): Promise<AutoImportCache> {
-  const [pv, inv] = await Promise.all([autoImportApi.preview(), sourcesApi.invalids()]);
+function readCache(): AutoImportCache | null {
+  try {
+    const raw = sessionStorage.getItem(SS_KEY);
+    if (!raw) return null;
+    const c = JSON.parse(raw) as AutoImportCache;
+    if (!c || typeof c.ts !== "number") return null;
+    return c;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(c: AutoImportCache) {
+  try {
+    sessionStorage.setItem(SS_KEY, JSON.stringify(c));
+  } catch {
+    /* 配额/隐私模式忽略 */
+  }
+}
+
+let moduleCache: AutoImportCache | null = readCache();
+
+function cacheFresh(c: AutoImportCache | null): boolean {
+  return !!c && Date.now() - c.ts < CACHE_TTL_MS;
+}
+
+/** 拉取配置（轻量，不扫网络） */
+async function fetchStatus(): Promise<AutoImportSettings> {
+  const pv = await autoImportApi.status();
   return {
-    config: pv
-      ? {
-          enabled: pv.enabled,
-          scheduleType: pv.scheduleType ?? "daily",
-          dailyTime: pv.dailyTime ?? "03:00",
-          weeklyDays: pv.weeklyDays ?? [0],
-          autoDeleteInvalid: pv.autoDeleteInvalid ?? false,
-          listUrl: pv.listUrl,
-          lastId: pv.lastId,
-          lastRunAt: pv.lastRunAt,
-          lastResult: pv.lastResult,
-          lastImportedCount: pv.lastImportedCount,
-        }
-      : null,
-    preview: pv
-      ? {
-          listUrl: pv.listUrl,
-          lastId: pv.lastId,
-          pendingCount: pv.pendingCount,
-          preview: pv.preview ?? [],
-        }
-      : null,
-    invalidList: inv ?? [],
-    ts: Date.now(),
+    enabled: pv.enabled,
+    scheduleType: pv.scheduleType ?? "daily",
+    dailyTime: pv.dailyTime ?? "03:00",
+    weeklyDays: pv.weeklyDays ?? [0],
+    autoDeleteInvalid: pv.autoDeleteInvalid ?? false,
+    listUrl: pv.listUrl,
+    lastId: pv.lastId,
+    lastRunAt: pv.lastRunAt,
+    lastResult: pv.lastResult,
+    lastImportedCount: pv.lastImportedCount,
+    taskState: pv.taskState ?? "",
+    taskProgress: pv.taskProgress ?? "",
+    running: !!pv.running,
   };
 }
 
-// 提前预取：在登录态就绪后调用，让“用户管理→书源自动导入”数据就绪，进页面秒开
+// 登录态就绪后预热：只拉轻量配置，让区块进页面即渲染
 export function prefetchAutoImport(force = false): void {
-  if (!force && moduleCache && Date.now() - moduleCache.ts < CACHE_TTL_MS) return;
-  if (prefetching && !force) return;
-  prefetching = fetchAutoImport()
-    .then((c) => {
-      moduleCache = c;
+  if (!force && cacheFresh(moduleCache)) return;
+  void fetchStatus()
+    .then((config) => {
+      moduleCache = {
+        config,
+        pendingCount: moduleCache?.pendingCount ?? null,
+        invalidList: moduleCache?.invalidList ?? [],
+        ts: Date.now(),
+      };
+      writeCache(moduleCache);
     })
     .catch(() => {
-      /* 预取失败不阻断，进页面时再拉 */
-    })
-    .finally(() => {
-      prefetching = null;
+      /* 预取失败不阻断 */
     });
 }
 
 export function AutoImportSection() {
-  const [config, setConfig] = useState<AutoImportSettings | null>(null);
-  const [preview, setPreview] = useState<PreviewData | null>(null);
-  const [invalidList, setInvalidList] = useState<InvalidBookSource[]>([]);
-  const [loading, setLoading] = useState(() => {
-    // 有新鲜模块缓存则直接渲染，不闪 loading
-    return !moduleCache || Date.now() - moduleCache.ts > CACHE_TTL_MS;
-  });
-  const [previewing, setPreviewing] = useState(false);
-  const [listUrlDraft, setListUrlDraft] = useState("");
+  const [config, setConfig] = useState<AutoImportSettings | null>(() => moduleCache?.config ?? null);
+  const [pendingCount, setPendingCount] = useState<number | null>(() => moduleCache?.pendingCount ?? null);
+  const [invalidList, setInvalidList] = useState<InvalidBookSource[]>(
+    () => moduleCache?.invalidList ?? [],
+  );
+  // 只有"连缓存都没有"才显示 loading，正常情况下直接渲染
+  const [loading, setLoading] = useState(() => !moduleCache?.config);
+  const [starting, setStarting] = useState(false);
+  const [listUrlDraft, setListUrlDraft] = useState(() => moduleCache?.config?.listUrl ?? "");
   const listUrlTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // 静默拉取并更新模块缓存 + 本地 state（不切 loading，不卸载整块）
-  const refreshSilent = async (force = false) => {
+  /** 静默刷新配置（不切 loading） */
+  const refreshStatus = async (): Promise<AutoImportSettings | null> => {
     try {
-      const c = force || !moduleCache ? await fetchAutoImport() : moduleCache;
-      moduleCache = c;
-      if (c.config) {
-        setConfig(c.config);
-        setListUrlDraft(c.config.listUrl);
-      }
-      if (c.preview) setPreview(c.preview);
-      setInvalidList(c.invalidList);
+      const c = await fetchStatus();
+      setConfig(c);
       setLoading(false);
+      moduleCache = {
+        config: c,
+        pendingCount,
+        invalidList,
+        ts: Date.now(),
+      };
+      writeCache(moduleCache);
+      return c;
     } catch {
       setLoading(false);
+      return null;
     }
   };
 
-  useEffect(() => {
-    // 有新鲜缓存：直接用，不发网络；过期或无缓存：拉一次并缓存
-    if (moduleCache && Date.now() - moduleCache.ts < CACHE_TTL_MS) {
-      setConfig(moduleCache.config);
-      setPreview(moduleCache.preview);
-      setInvalidList(moduleCache.invalidList);
-      setLoading(false);
-    } else {
-      setLoading(true);
-      void refreshSilent(true);
+  /** 后台扫待导入数量（走网络，不阻塞渲染） */
+  const refreshScan = async () => {
+    try {
+      const r = await autoImportApi.scan();
+      setPendingCount(r.pendingCount);
+      moduleCache = {
+        config: moduleCache?.config ?? null,
+        pendingCount: r.pendingCount,
+        invalidList: moduleCache?.invalidList ?? [],
+        ts: Date.now(),
+      };
+      writeCache(moduleCache);
+    } catch {
+      /* 扫描失败保留旧值 */
     }
+  };
+
+  /** 失效源列表（与配置并行拉） */
+  const refreshInvalid = async () => {
+    try {
+      const inv = await sourcesApi.invalids();
+      setInvalidList(inv ?? []);
+      moduleCache = {
+        config: moduleCache?.config ?? null,
+        pendingCount: moduleCache?.pendingCount ?? null,
+        invalidList: inv ?? [],
+        ts: Date.now(),
+      };
+      writeCache(moduleCache);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const stopPolling = () => {
+    if (pollTimer.current) {
+      clearInterval(pollTimer.current);
+      pollTimer.current = null;
+    }
+  };
+
+  /** 任务运行期间轮询进度，结束后停 */
+  const startPolling = () => {
+    stopPolling();
+    pollTimer.current = setInterval(() => {
+      void refreshStatus().then((c) => {
+        if (c && !c.running && c.taskState !== "running") {
+          stopPolling();
+          // 跑完刷新一次待导入数量
+          void refreshScan();
+        }
+      });
+    }, 5000);
+  };
+
+  useEffect(() => {
+    if (moduleCache?.config) {
+      setConfig(moduleCache.config);
+      setListUrlDraft(moduleCache.config.listUrl);
+      setLoading(false);
+      if (moduleCache.config.running) startPolling();
+    }
+    // 首屏：配置 + 失效源 + 待导入数量 三路并行，各自回填，互相不阻塞
+    void refreshStatus().then((c) => {
+      if (c?.running) startPolling();
+    });
+    void refreshInvalid();
+    void refreshScan();
     return () => {
       if (listUrlTimer.current) clearTimeout(listUrlTimer.current);
+      stopPolling();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 保存后端字段：乐观更新本地 + 后台静默同步，不切 loading、不卸载区块
+  // 保存后端字段：乐观更新本地 + 后台静默同步
   const save = async (fields: {
     enabled?: boolean;
     scheduleType?: "daily" | "weekly";
@@ -145,41 +221,37 @@ export function AutoImportSection() {
     autoDeleteInvalid?: boolean;
     listUrl?: string;
   }) => {
-    // 乐观更新本地，UI 立即反映
     setConfig((c) => (c ? { ...c, ...fields } : c));
-    setPreview((p) => (p ? { ...p, ...(fields.listUrl !== undefined ? { listUrl: fields.listUrl } : null) } : p));
     try {
-      await autoImportApi.saveConfig(fields);
+      const next = await autoImportApi.saveConfig(fields);
+      // saveConfig 返回完整配置，直接对齐服务端真值
+      setConfig((c) => (c ? { ...c, ...next } : c));
     } catch (e) {
       notify.error(e instanceof Error ? e.message : "保存失败");
-      // 失败则回滚：重新拉取真实状态
-      await refreshSilent(true);
+      await refreshStatus();
     }
   };
 
-  // 列表页地址：输入时只改本地草稿，防抖 600ms 后保存，避免每敲一键就 POST
   const onListUrlChange = (v: string) => {
     setListUrlDraft(v);
     if (listUrlTimer.current) clearTimeout(listUrlTimer.current);
     listUrlTimer.current = setTimeout(() => {
-      save({ listUrl: v });
+      void save({ listUrl: v });
+      void refreshScan();
     }, 600);
   };
 
   const handleRun = async () => {
     try {
-      setPreviewing(true);
+      setStarting(true);
       const res = await autoImportApi.run();
-      notify.success(
-        `导入 ${res.importedEntries} 个合集 / ${res.importedSources} 个书源` +
-          (res.deletedInvalid > 0 ? `，删除 ${res.deletedInvalid} 个失效源` : ""),
-      );
-      // 执行后拉新数据并更新缓存
-      await refreshSilent(true);
+      notify.success(res.message || "已在后台开始导入");
+      await refreshStatus();
+      startPolling();
     } catch (e) {
-      notify.error(e instanceof Error ? e.message : "执行失败");
+      notify.error(e instanceof Error ? e.message : "启动失败");
     } finally {
-      setPreviewing(false);
+      setStarting(false);
     }
   };
 
@@ -187,7 +259,7 @@ export function AutoImportSection() {
     try {
       const res = await sourcesApi.deleteInvalid();
       notify.success(`已删除 ${res.deleted} 个失效书源`);
-      await refreshSilent(true);
+      await refreshInvalid();
     } catch (e) {
       notify.error(e instanceof Error ? e.message : "删除失效源失败");
     }
@@ -321,24 +393,29 @@ export function AutoImportSection() {
             </div>
           )}
 
-          {/* 待导入预览 */}
-          {preview && preview.pendingCount > 0 && (
-            <div className="space-y-2">
-              <div className="text-xs font-medium">
-                待导入新条目：{preview.pendingCount} 个
-              </div>
-              <div className="max-h-40 space-y-1 overflow-y-auto">
-                {preview.preview.map((p) => (
-                  <div key={p.id} className="flex items-center gap-2 text-xs">
-                    <Badge>{p.id}</Badge>
-                    {p.jsonUrl ? (
-                      <span className="truncate text-success">{p.jsonUrl}</span>
-                    ) : (
-                      <span className="text-danger">{p.error ?? "无法解析"}</span>
-                    )}
-                  </div>
-                ))}
-              </div>
+          {/* 后台任务进度 */}
+          {config?.running && (
+            <div className="flex items-center gap-2 rounded-lg bg-accent-soft/60 px-3 py-2 text-xs">
+              <Spinner />
+              <span className="text-accent">{config.taskProgress || "正在后台导入…"}</span>
+            </div>
+          )}
+          {!config?.running && config?.taskState === "done" && config.taskProgress && (
+            <div className="text-xs text-success">✓ {config.taskProgress}</div>
+          )}
+          {!config?.running && config?.taskState === "error" && config.taskProgress && (
+            <div className="text-xs text-danger">✗ {config.taskProgress}</div>
+          )}
+
+          {/* 待导入数量（由轻量扫描异步回填） */}
+          {pendingCount !== null && (
+            <div className="text-xs text-muted">
+              待导入新条目：
+              {pendingCount > 0 ? (
+                <span className="ml-1 font-medium text-accent">{pendingCount} 个</span>
+              ) : (
+                <span className="ml-1">无（已是最新）</span>
+              )}
             </div>
           )}
 
@@ -363,11 +440,13 @@ export function AutoImportSection() {
           <Button
             variant="primary"
             onClick={handleRun}
-            disabled={!config?.enabled || previewing}
-            loading={previewing}
+            disabled={!config?.enabled || starting || !!config?.running}
+            loading={starting}
           >
-            {previewing ? (
-              "正在执行…"
+            {config?.running ? (
+              "后台导入中…"
+            ) : starting ? (
+              "正在启动…"
             ) : (
               <span className="flex items-center gap-1.5">
                 <RefreshCw className="h-3.5 w-3.5" />
