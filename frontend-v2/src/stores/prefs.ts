@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
+import { userConfigApi } from "@/api/endpoints";
 
 export type PaperTheme = "paper" | "parchment" | "celadon" | "dark" | "system";
 export type ReaderFont =
@@ -118,9 +119,75 @@ export const usePrefsStore = create<PrefsState>()(
       name: "mojuan.prefs.v2",
       version: 1,
       storage: createJSONStorage(() => localStorage),
+      // 服务端持久化：登录后从 /reader3/userConfig 拉取并合并，变更防抖回写
+      onRehydrateStorage: () => (state) => {
+        if (state) void syncFromServer(state);
+      },
     },
   ),
 );
+
+const SYNCED_KEYS = [
+  "theme",
+  "fontFamily",
+  "customFontFamily",
+  "fontSize",
+  "lineHeight",
+  "paragraphGap",
+  "contentWidth",
+  "indentParagraph",
+  "readLayout",
+  "spreadMode",
+  "pageTurnMode",
+  "autoScrollSpeed",
+  "searchTimeout",
+  "ttsEngine",
+  "ttsVoice",
+  "ttsRate",
+  "ttsAutoNext",
+] as const;
+
+/** 从服务端拉取配置并合并进 store（未登录/失败静默忽略） */
+async function syncFromServer(current: PrefsState) {
+  try {
+    const remote = await userConfigApi.get();
+    if (!remote || typeof remote !== "object") return;
+    const patch: Record<string, unknown> = {};
+    for (const k of SYNCED_KEYS) {
+      if (k in remote) patch[k] = (remote as Record<string, unknown>)[k];
+    }
+    if (Object.keys(patch).length === 0) {
+      // 服务端没有记录：把本地当前值推上去，作为该用户初始配置
+      void pushToServer(current);
+      return;
+    }
+    usePrefsStore.setState(patch as Partial<PrefsState>);
+  } catch {
+    /* 未登录或网络失败：保留本地设置 */
+  }
+}
+
+let pushTimer: ReturnType<typeof setTimeout> | null = null;
+/** 防抖回写服务端（500ms），失败静默 */
+function pushToServer(state: PrefsState) {
+  if (pushTimer) clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => {
+    const payload: Record<string, unknown> = {};
+    for (const k of SYNCED_KEYS) payload[k] = state[k];
+    void userConfigApi.save(payload).catch(() => {});
+  }, 500);
+}
+
+let lastPushed: Partial<PrefsState> = usePrefsStore.getState();
+usePrefsStore.subscribe((state) => {
+  for (const k of SYNCED_KEYS) {
+    if (state[k] !== lastPushed[k]) {
+      lastPushed = state;
+      pushToServer(state);
+      return;
+    }
+  }
+});
 
 export function resolvePaperTheme(theme: PaperTheme): Exclude<PaperTheme, "system"> {
   if (theme !== "system") return theme;

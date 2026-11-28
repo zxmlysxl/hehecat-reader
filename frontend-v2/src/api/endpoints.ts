@@ -121,6 +121,14 @@ export const autoImportApi = {
     apiPost<AutoImportRunResult>("/reader3/autoImportRun", { forceFullScan }, { timeoutMs: 600_000 }),
 };
 
+/* ---------- User config (reading prefs, persisted server-side) ---------- */
+
+export const userConfigApi = {
+  get: () => apiGet<Record<string, unknown>>("/reader3/userConfig"),
+  save: (body: Record<string, unknown>) =>
+    apiPost<{ ok: boolean }>("/reader3/saveUserConfig", body),
+};
+
 /* ---------- Bookshelf, Reading, Groups, Bookmarks & Local Import ---------- */
 
 export interface RemoteBookProgress {

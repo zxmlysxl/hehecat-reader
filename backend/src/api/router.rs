@@ -20,7 +20,7 @@ use axum::routing::{get, post};
 use axum::Json;
 use serde_json::{json, Value};
 
-use crate::api::{assets, auth, auto_import, books, features, files, search, sources};
+use crate::api::{assets, auth, auto_import, books, features, files, search, sources, user_config};
 use crate::storage::Storage;
 
 /// 统一 API 返回结构（`isSuccess` / `errorMsg` / `data`，camelCase；默认 `T = Value` 保持 100% 向后兼容）
@@ -205,6 +205,11 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route(
             "/reader3/resetUserPassword",
             post(auth::reset_user_password),
+        )
+        .route("/reader3/userConfig", get(user_config::get_user_config))
+        .route(
+            "/reader3/saveUserConfig",
+            post(user_config::save_user_config),
         )
         .route(
             "/reader3/clearInactiveUsers",
