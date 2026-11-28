@@ -326,14 +326,22 @@ pub async fn run_with_limit(
             details.push(format!("#{id} 无有效书源"));
             continue;
         }
-        let count = sources.len();
-        if let Err(e) = storage.save_book_sources(ns, &sources).await {
-            details.push(format!("#{id} 写入失败: {e}"));
-            continue;
-        }
+        let parsed = sources.len();
+        let (inserted, updated) = match storage.save_book_sources_counted(ns, &sources).await {
+            Ok(x) => x,
+            Err(e) => {
+                details.push(format!("#{id} 写入失败: {e}"));
+                continue;
+            }
+        };
         imported_entries += 1;
-        imported_sources += count;
-        details.push(format!("#{id} 导入 {count} 个书源"));
+        // 只统计真实新增入库的源数（与已有源重复/被覆盖的不算）
+        imported_sources += inserted;
+        if updated > 0 {
+            details.push(format!("#{id} 新增 {inserted} 个书源（{updated} 个已存在已更新，来源共 {parsed} 个）"));
+        } else {
+            details.push(format!("#{id} 新增 {inserted} 个书源"));
+        }
         // 已成功导入的条目才推进 last_id（失败的条目下次重试）
         cfg.last_id = cfg.last_id.max(id);
     }

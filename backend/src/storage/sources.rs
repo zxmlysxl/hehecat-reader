@@ -337,13 +337,38 @@ impl Storage {
         ns: &str,
         sources: &[crate::model::BookSource],
     ) -> Result<()> {
+        self.save_book_sources_counted(ns, sources).await.map(|_| ())
+    }
+
+    /// 同 `save_book_sources`，但返回 (新增条数, 更新条数)。
+    /// 用于自动导入等场景统计"真实入库"数量（去重/覆盖的源不算新增）。
+    pub async fn save_book_sources_counted(
+        &self,
+        ns: &str,
+        sources: &[crate::model::BookSource],
+    ) -> Result<(usize, usize)> {
         let mut tx = self.begin_immediate().await?;
+        let mut inserted = 0usize;
+        let mut updated = 0usize;
         for source in sources {
+            // 先查该源在当前命名空间是否已存在（含 hidden 覆盖行）
+            let existed: Option<(i64,)> = sqlx::query_as(
+                "SELECT 1 FROM book_sources WHERE user_namespace = ?1 AND book_source_url = ?2",
+            )
+            .bind(ns)
+            .bind(&source.book_source_url)
+            .fetch_optional(&mut *tx)
+            .await?;
             upsert_book_source(&mut *tx, ns, source).await?;
+            if existed.is_some() {
+                updated += 1;
+            } else {
+                inserted += 1;
+            }
         }
         tx.commit().await?;
         invalidate_book_sources_cache(self.cache_tag);
-        Ok(())
+        Ok((inserted, updated))
     }
 
     /// 删除书源（连带清理 cookie；非 default 用户删除系统源时写入 hidden 覆盖）
