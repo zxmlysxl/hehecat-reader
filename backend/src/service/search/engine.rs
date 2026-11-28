@@ -531,7 +531,7 @@ async fn search_one_source_unbounded(
     timeout_secs: u64,
 ) -> Result<Vec<SearchBook>> {
     // F2/EG5 配套：600s 内已标记失效的书源跳过请求
-    if crate::service::health::is_source_invalid(ns, source.book_source_url.as_str()) {
+    if crate::service::health::is_source_invalid(ns, &source.book_source_url).await {
         return Ok(vec![]);
     }
     // 10min 搜索结果缓存: 同关键词+页+源重搜免回源 (连载新书容忍 10min 延迟)
@@ -543,7 +543,7 @@ async fn search_one_source_unbounded(
     }
     match search_one_source_impl(storage, ns, source, key, page, timeout_secs).await {
         Ok(v) => {
-            crate::service::health::clear_source_invalid(ns, &source.book_source_url);
+            crate::service::health::clear_source_invalid(ns, &source.book_source_url).await;
             if !v.is_empty() {
                 if let Ok(json) = serde_json::to_string(&v) {
                     let _ = storage.put_search_cache(ns, &cache_key, &json).await;

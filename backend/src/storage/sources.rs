@@ -332,6 +332,86 @@ impl Storage {
     }
 
     /// 批量保存书源（单事务）
+    // ============ 失效书源持久化 ============
+
+    /// 标记书源失效（upsert）
+    pub async fn mark_invalid_source(
+        &self,
+        ns: &str,
+        source_url: &str,
+        error_msg: &str,
+        ts: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO invalid_sources (user_namespace, source_url, error_msg, marked_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (user_namespace, source_url) DO UPDATE SET error_msg = excluded.error_msg, marked_at = excluded.marked_at",
+        )
+        .bind(ns)
+        .bind(source_url)
+        .bind(error_msg)
+        .bind(ts)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 清除书源失效标记
+    pub async fn clear_invalid_source(&self, ns: &str, source_url: &str) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM invalid_sources WHERE user_namespace = ? AND source_url = ?",
+        )
+        .bind(ns)
+        .bind(source_url)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 判断书源是否在失效期内
+    pub async fn is_invalid_source(&self, ns: &str, source_url: &str, now: i64) -> bool {
+        let cutoff = now - 24 * 3600 * 1000;
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT marked_at FROM invalid_sources WHERE user_namespace = ? AND source_url = ? AND marked_at >= ?",
+        )
+        .bind(ns)
+        .bind(source_url)
+        .bind(cutoff)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        row.is_some()
+    }
+
+    /// 读取命名空间下标记时间 >= since 的失效记录
+    pub async fn get_invalid_sources(
+        &self,
+        ns: &str,
+        since: i64,
+    ) -> Vec<(String, i64, String)> {
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT source_url, marked_at, error_msg FROM invalid_sources WHERE user_namespace = ? AND marked_at >= ?",
+        )
+        .bind(ns)
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        rows
+    }
+
+    /// 删除命名空间下全部失效标记
+    pub async fn clear_invalid_sources_all(&self, ns: &str) -> u64 {
+        let res = sqlx::query(
+            "DELETE FROM invalid_sources WHERE user_namespace = ?",
+        )
+        .bind(ns)
+        .execute(&self.pool)
+        .await;
+        res.map(|r| r.rows_affected()).unwrap_or(0)
+    }
+
     pub async fn save_book_sources(
         &self,
         ns: &str,

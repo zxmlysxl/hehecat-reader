@@ -1,4 +1,4 @@
-//! 书源健康检测（getInvalidBookSources）：运行期失败快照 + 并发 HEAD/首页检测（禁用接口用）
+//! 书源健康检测（getInvalidBookSources）：持久化失效书源快照 + 并发 HEAD/首页检测
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -7,17 +7,12 @@ use std::time::{Duration, SystemTime};
 use crate::model::BookSource;
 use crate::service::crawler;
 
-/// 失效快照 TTL：legacy addInvalidBookSource 缓存 600 秒
-const INVALID_SNAPSHOT_TTL_MS: i64 = 600 * 1000;
+/// 失效书源持久化 TTL：24 小时（重启后保留，跨浏览器共享）
+const INVALID_SNAPSHOT_TTL_MS: i64 = 24 * 3600 * 1000;
 
-/// 运行期失效书源快照（legacy invalidBookSourceCache 对齐）：
-/// key = namespace:source_url，value = (记录时间戳 ms, 错误信息)
-static INVALID_SOURCE_SNAPSHOT: LazyLock<Mutex<HashMap<String, (i64, String)>>> =
+/// 内存热缓存（避免高频读 DB）；DB 是权威来源
+static INVALID_SOURCE_HOT: LazyLock<Mutex<HashMap<String, (i64, String)>>> =
     LazyLock::new(Default::default);
-
-fn snapshot_key(ns: &str, source_url: &str) -> String {
-    format!("{ns}:{source_url}")
-}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -26,54 +21,73 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-/// 标记书源运行期失败（搜索/详情/目录/正文实际抓取报错时调用）；
-/// 600 秒内 [`invalid_snapshot`] 直接返回该记录，不重新探测。
-pub fn mark_source_invalid(ns: &str, source_url: &str, error_msg: &str) {
-    let mut map = INVALID_SOURCE_SNAPSHOT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    map.insert(
-        snapshot_key(ns, source_url),
-        (now_ms(), error_msg.to_string()),
-    );
+/// 标记书源失效：写 DB + 内存热缓存。
+/// 需在 async 上下文中调用（Storage 通过 task_local 获取）。
+pub async fn mark_source_invalid(ns: &str, source_url: &str, error_msg: &str) {
+    let ts = now_ms();
+    {
+        let mut map = INVALID_SOURCE_HOT.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(format!("{ns}:{source_url}"), (ts, error_msg.to_string()));
+    }
+    if let Some(storage) = crate::storage::current_task_storage() {
+        let _ = storage.mark_invalid_source(ns, source_url, error_msg, ts).await;
+    }
 }
 
-/// 成功抓取后清除对应源的失败标记
-pub fn clear_source_invalid(ns: &str, source_url: &str) {
-    let mut map = INVALID_SOURCE_SNAPSHOT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    map.remove(&snapshot_key(ns, source_url));
+/// 成功抓取后清除失败标记：删 DB + 内存
+pub async fn clear_source_invalid(ns: &str, source_url: &str) {
+    {
+        let mut map = INVALID_SOURCE_HOT.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(&format!("{ns}:{source_url}"));
+    }
+    if let Some(storage) = crate::storage::current_task_storage() {
+        let _ = storage.clear_invalid_source(ns, source_url).await;
+    }
 }
 
-/// 判断书源是否处于 600 秒失效期内（搜索等请求前置短路用：
-/// legacy searchBookWithSource 发请求前先查 invalidBookSourceCache）
-pub fn is_source_invalid(ns: &str, source_url: &str) -> bool {
+/// 判断书源是否处于 24h 失效期内（搜索等请求前置短路用）
+/// 先查内存热缓存，miss 时查 DB。
+pub async fn is_source_invalid(ns: &str, source_url: &str) -> bool {
+    {
+        let map = INVALID_SOURCE_HOT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((ts, _)) = map.get(&format!("{ns}:{source_url}")) {
+            if now_ms() - *ts < INVALID_SNAPSHOT_TTL_MS {
+                return true;
+            }
+        }
+    }
+    if let Some(storage) = crate::storage::current_task_storage() {
+        return storage.is_invalid_source(ns, source_url, now_ms()).await;
+    }
+    false
+}
+
+/// 读取命名空间下 24h 内的失效记录（DB + 内存合并，过期清理）
+/// → [(sourceUrl, time, errorMsg)]
+pub async fn invalid_snapshot(ns: &str) -> Vec<(String, i64, String)> {
     let now = now_ms();
-    let map = INVALID_SOURCE_SNAPSHOT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    map.get(&snapshot_key(ns, source_url))
-        .is_some_and(|(ts, _)| now - *ts < INVALID_SNAPSHOT_TTL_MS)
-}
-
-/// 读取命名空间下 600 秒内的失败记录（过期条目顺带清理）→ [(sourceUrl, time, errorMsg)]
-pub fn invalid_snapshot(ns: &str) -> Vec<(String, i64, String)> {
-    let now = now_ms();
-    let prefix = format!("{ns}:");
-    let mut map = INVALID_SOURCE_SNAPSHOT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    map.retain(|_, (ts, _)| now - *ts < INVALID_SNAPSHOT_TTL_MS);
-    let mut out: Vec<(String, i64, String)> = map
-        .iter()
-        .filter(|(k, _)| k.starts_with(&prefix))
-        .map(|(k, (ts, err))| (k[prefix.len()..].to_string(), *ts, err.clone()))
-        .collect();
+    // 从 DB 读
+    let mut out: Vec<(String, i64, String)> = if let Some(storage) = crate::storage::current_task_storage() {
+        storage.get_invalid_sources(ns, now - INVALID_SNAPSHOT_TTL_MS).await
+    } else {
+        Vec::new()
+    };
+    // 合并内存热缓存（可能比 DB 更新）
+    {
+        let map = INVALID_SOURCE_HOT.lock().unwrap_or_else(|e| e.into_inner());
+        let prefix = format!("{ns}:");
+        for (k, (ts, err)) in map.iter().filter(|(k, (ts, _))| now - *ts < INVALID_SNAPSHOT_TTL_MS) {
+            if k.starts_with(&prefix) {
+                let url = k[prefix.len()..].to_string();
+                if !out.iter().any(|(u, _, _)| *u == url) {
+                    out.push((url, *ts, err.clone()));
+                }
+            }
+        }
+    }
     out.sort_by_key(|x| std::cmp::Reverse(x.1));
     out
 }
-
 /// 单书源健康检测：HEAD 优先（405/501 或失败回退 GET 首页）
 /// 返回 (是否可用, 说明)
 pub async fn check_source(_ns: &str, source: &BookSource) -> (bool, String) {

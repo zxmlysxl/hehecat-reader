@@ -553,14 +553,14 @@ pub async fn check_book_sources_sse(
         while let Some((source, ok, reason)) = tasks.next().await {
             checked += 1;
             if ok {
-                crate::service::health::clear_source_invalid(&ns, &source.book_source_url);
+                crate::service::health::clear_source_invalid(&ns, &source.book_source_url).await;
             } else {
                 invalid_count += 1;
                 crate::service::health::mark_source_invalid(
                     &ns,
                     &source.book_source_url,
                     &reason,
-                );
+                ).await;
             }
             let payload = json!({
                 "total": total,
@@ -600,12 +600,12 @@ pub async fn delete_invalid_book_sources(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
-    let snapshot = crate::service::health::invalid_snapshot(&namespace);
+    let snapshot = crate::service::health::invalid_snapshot(&namespace).await;
     let mut deleted = 0u64;
     for (url, _time, _err) in snapshot {
         if let Ok(n) = state.storage.delete_book_source(&namespace, &url).await {
             deleted += n;
-            crate::service::health::clear_source_invalid(&namespace, &url);
+            crate::service::health::clear_source_invalid(&namespace, &url).await;
         }
     }
     Json(ReturnData::ok(json!({ "deleted": deleted })))
@@ -744,7 +744,7 @@ pub async fn get_invalid_book_sources(
         Ok(ns) => ns,
         Err(ret) => return Json(ret).into_response(),
     };
-    let arr: Vec<InvalidBookSourceItem> = crate::service::health::invalid_snapshot(&namespace)
+    let arr: Vec<InvalidBookSourceItem> = crate::service::health::invalid_snapshot(&namespace).await
         .into_iter()
         .map(|(source_url, time, error)| InvalidBookSourceItem {
             book_source_url: source_url.clone(),

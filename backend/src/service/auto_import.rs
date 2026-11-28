@@ -251,17 +251,17 @@ async fn check_and_delete_invalid(
     let mut deleted = 0usize;
     while let Some((source, ok)) = tasks.next().await {
         if ok {
-            crate::service::health::clear_source_invalid(ns, &source.book_source_url);
+            crate::service::health::clear_source_invalid(ns, &source.book_source_url).await;
         } else {
-            crate::service::health::mark_source_invalid(ns, &source.book_source_url, "自动检测失效");
+            crate::service::health::mark_source_invalid(ns, &source.book_source_url, "自动检测失效").await;
         }
     }
     // 删除已标记失效的
-    let snapshot = crate::service::health::invalid_snapshot(ns);
+    let snapshot = crate::service::health::invalid_snapshot(ns).await;
     for (url, _time, _err) in snapshot {
         if storage.delete_book_source(ns, &url).await.is_ok() {
             deleted += 1;
-            crate::service::health::clear_source_invalid(ns, &url);
+            crate::service::health::clear_source_invalid(ns, &url).await;
         }
     }
     Ok(deleted)

@@ -46,7 +46,7 @@ pub async fn analyze_content(
     .await
     {
         Ok(v) => {
-            crate::service::health::clear_source_invalid(ns, &source.book_source_url);
+            crate::service::health::clear_source_invalid(ns, &source.book_source_url).await;
             Ok(v)
         }
         Err(e) => {

@@ -274,7 +274,7 @@ pub async fn fetch_book_info(
 ) -> Result<BookInfo> {
     match fetch_book_info_impl(ns, url, source, book_name).await {
         Ok(v) => {
-            crate::service::health::clear_source_invalid(ns, &source.book_source_url);
+            crate::service::health::clear_source_invalid(ns, &source.book_source_url).await;
             Ok(v)
         }
         Err(e) => {

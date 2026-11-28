@@ -227,6 +227,16 @@ pub(crate) async fn init_schema(pool: &SqlitePool) -> Result<bool> {
             PRIMARY KEY (user_namespace, source_url)
         );
         "#,
+        // ---------------- 失效书源持久化 ----------------
+        r#"
+        CREATE TABLE IF NOT EXISTS invalid_sources (
+            user_namespace TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            error_msg TEXT NOT NULL DEFAULT '',
+            marked_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_namespace, source_url)
+        );
+        "#,
         // ---------------- 缓存与脚本持久化 ----------------
         r#"
         CREATE TABLE IF NOT EXISTS toc_cache (

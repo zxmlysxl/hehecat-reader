@@ -212,7 +212,7 @@ pub async fn explore_book(
     };
     match explore_res {
         Ok(books) => {
-            crate::service::health::clear_source_invalid(&namespace, &source.book_source_url);
+            crate::service::health::clear_source_invalid(&namespace, &source.book_source_url).await;
             let _ = state
                 .storage
                 .record_path_outcome(
@@ -535,11 +535,26 @@ pub async fn search_book_multi_sse(
         .filter(|s| {
             s.enabled
                 && s.search_url.is_some()
-                && !crate::service::health::is_source_invalid(&namespace, &s.book_source_url)
         })
         .filter(|s| book_source_group_matches(&group, s.book_source_group.as_deref()))
         .filter(|s| single_source_url.is_empty() || s.book_source_url == single_source_url)
         .collect();
+    // 过滤失效源（异步检查）
+    let ns_clone = namespace.clone();
+    let valid_sources: Vec<crate::model::BookSource> = futures::stream::iter(sources.into_iter())
+        .filter_map(|s| {
+            let ns2 = ns_clone.clone();
+            async move {
+                if !crate::service::health::is_source_invalid(&ns2, &s.book_source_url).await {
+                    Some(s)
+                } else {
+                    None
+                }
+            }
+        })
+        .collect()
+        .await;
+    let mut sources = valid_sources;
     let stats_rows = state
         .storage
         .get_source_stats(&namespace)

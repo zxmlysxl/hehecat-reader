@@ -70,7 +70,7 @@ pub async fn analyze_toc(
     }
     match result {
         Ok(v) => {
-            crate::service::health::clear_source_invalid(ns, &source.book_source_url);
+            crate::service::health::clear_source_invalid(ns, &source.book_source_url).await;
             if let Some(st) = crate::parser::rule::registered_storage() {
                 let _ = st
                     .record_path_outcome(ns, &source.book_source_url, "toc", !v.is_empty())
