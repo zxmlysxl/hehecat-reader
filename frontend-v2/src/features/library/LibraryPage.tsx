@@ -175,34 +175,37 @@ export default function LibraryPage() {
   const [unlockedGroups, setUnlockedGroups] = React.useState<Set<number>>(() => new Set());
   // 正在请求解锁的分组（null = 不弹密码框）
   const [pwGroup, setPwGroup] = React.useState<BookGroupWithCount | null>(null);
+  // 解锁到期表 { groupId: expireAt } — 每次解锁/访问续期，过期自动加锁
+  const UNLOCK_TTL_MS = 5 * 60 * 1000; // 5 分钟
+  const unlockExpireRef = React.useRef<Map<number, number>>(new Map());
 
-  // 仍上锁的分组 id 集合（hasPassword 且未解锁）
-  const lockedIds = React.useMemo(() => {
-    const s = new Set<number>();
-    for (const g of groups) {
-      if (g.hasPassword && !unlockedGroups.has(g.id)) s.add(g.id);
-    }
-    return s;
-  }, [groups, unlockedGroups]);
-
-  // 判断书是否落入任一仍上锁的分组（“全部”视图下用于隐藏）
+  // “全部”视图永久屏蔽的分组：所有 hasPassword 分组（不管是否已解锁）
+  // 解锁只允许查看该分组本身，不会让里面的书泄漏到“全部”
+  const allPasswordGroupIds = React.useMemo(
+    () => new Set<number>(groups.filter((g) => g.hasPassword).map((g) => g.id)),
+    [groups],
+  );
   const bookInLockedGroup = React.useCallback(
     (b: Book): boolean => {
-      if (lockedIds.size === 0) return false;
+      if (allPasswordGroupIds.size === 0) return false;
       const ids =
         b.groupIds && b.groupIds.length > 0 ? b.groupIds : b.group > 0 ? [b.group] : [];
-      return ids.some((id) => lockedIds.has(id));
+      return ids.some((id) => allPasswordGroupIds.has(id));
     },
-    [lockedIds],
+    [allPasswordGroupIds],
   );
 
-  // 点击分组：有密码且未解锁 → 弹密码框；否则直接选中
+  // 点击分组：有密码且未解锁 → 弹密码框；否则直接选中（并续期解锁）
   const handleGroupClick = React.useCallback(
     (g: BookGroupWithCount) => {
       if (g.hasPassword && !unlockedGroups.has(g.id)) {
         setPwGroup(g);
       } else {
         setActiveGroup(g.id);
+        // 已解锁的分组点击 → 续期
+        if (g.hasPassword && unlockedGroups.has(g.id)) {
+          unlockExpireRef.current.set(g.id, Date.now() + UNLOCK_TTL_MS);
+        }
       }
     },
     [unlockedGroups],
@@ -210,6 +213,35 @@ export default function LibraryPage() {
 
   /* ---------------- UI State ---------------- */
   const [activeGroup, setActiveGroup] = React.useState<GroupFilter>("all");
+
+  // 解锁到期自动加锁：每 30 s 检查一次
+  React.useEffect(() => {
+    const timer = setInterval(() => {
+      const now = Date.now();
+      let changed = false;
+      const next = new Set(unlockedGroups);
+      for (const id of next) {
+        const exp = unlockExpireRef.current.get(id);
+        if (exp !== undefined && now >= exp) {
+          next.delete(id);
+          unlockExpireRef.current.delete(id);
+          changed = true;
+        }
+      }
+      if (changed) {
+        setUnlockedGroups(next);
+      }
+    }, 30_000);
+    return () => clearInterval(timer);
+  }, [unlockedGroups]);
+
+  // 如果当前 active 的分组被自动加锁了，回退到“全部”
+  React.useEffect(() => {
+    if (typeof activeGroup === "number" && !unlockedGroups.has(activeGroup) &&
+        groups.some((g) => g.id === activeGroup && g.hasPassword)) {
+      setActiveGroup("all");
+    }
+  }, [unlockedGroups, activeGroup, groups]);
   const [searchQuery, setSearchQuery] = React.useState("");
   const [searchFocused, setSearchFocused] = React.useState(false);
   const searchInputRef = React.useRef<HTMLInputElement>(null);
@@ -1140,6 +1172,7 @@ export default function LibraryPage() {
             next.add(id);
             return next;
           });
+          unlockExpireRef.current.set(id, Date.now() + UNLOCK_TTL_MS);
           setActiveGroup(id);
           setPwGroup(null);
         }}

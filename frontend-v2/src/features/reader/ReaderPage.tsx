@@ -4,7 +4,6 @@ import {
   ArrowLeft,
   ArrowLeftRight,
   BookOpen,
-  CloudDownload,
   Download,
   Headphones,
   RefreshCw,
@@ -12,7 +11,7 @@ import {
 import * as React from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { fontFileUrl, resolveImageUrl } from "@/api/client";
-import { booksApi, featuresApi, type RemoteBookProgress } from "@/api/endpoints";
+import { booksApi, featuresApi } from "@/api/endpoints";
 import type {
   Book,
   BookChapter,
@@ -36,7 +35,6 @@ import { notify } from "@/stores/toast";
 import { BookCover } from "@/ui/BookCover";
 import { Button } from "@/ui/Button";
 import { EmptyView, Spinner } from "@/ui/Controls";
-import { AnimatePresence, motion, SPRING_POP, useReducedMotion } from "@/ui/motion";
 import {
   ChapterEndColophon,
   PagedCanvas,
@@ -390,9 +388,6 @@ export default function ReaderPage() {
   const [autoScrollActive, setAutoScrollActive] = React.useState(false);
   const [isFullscreen, setIsFullscreen] = React.useState(false);
 
-  const reduced = useReducedMotion();
-  const [remoteSyncBanner, setRemoteSyncBanner] = React.useState<RemoteBookProgress | null>(null);
-
   const stageContainerRef = React.useRef<HTMLDivElement>(null);
   const resolvedBookRef = React.useRef<string>("");
   const baseChapterTimeRef = React.useRef<number>(0);
@@ -421,10 +416,8 @@ export default function ReaderPage() {
     baseChapterTimeRef.current = remoteTime;
     syncedPosRef.current = { chapterIndex: initIdx, paraIndex: initPos };
     forceNextSaveRef.current = false;
-    setRemoteSyncBanner(null);
 
-    // 默认直接采用服务器最新进度，不再弹"同步跳转"确认条。
-    // 仅当 URL 显式带了过期 ?index=（如从别处的旧链接进来）时，静默跟随最新进度。
+    // 默认直接采用服务器最新进度（?index= 参数过期时静默跟随），不再弹确认条。
     if (
       parsedUrlIndex !== null &&
       shelfBook &&
@@ -463,7 +456,6 @@ export default function ReaderPage() {
       const syncPos = shelfBook.durChapterPos ?? 0;
       baseChapterTimeRef.current = remoteTime;
       syncedPosRef.current = { chapterIndex: syncIdx, paraIndex: syncPos };
-      setRemoteSyncBanner(null);
       jumpToPosition(syncIdx, syncPos, "start");
     } else {
       baseChapterTimeRef.current = remoteTime;
@@ -756,7 +748,15 @@ export default function ReaderPage() {
         )
         .then((res) => {
           if (res?.conflict && res.remote) {
-            setRemoteSyncBanner(res.remote);
+            // 自动跟随远端进度，不再弹确认条
+            const r = res.remote;
+            baseChapterTimeRef.current = r.durChapterTime ?? Date.now();
+            syncedPosRef.current = {
+              chapterIndex: r.durChapterIndex,
+              paraIndex: r.durChapterPos ?? 0,
+            };
+            forceNextSaveRef.current = false;
+            jumpToPosition(r.durChapterIndex, r.durChapterPos ?? 0, "start");
             return;
           }
           const serverTime = res?.durChapterTime ?? Date.now();
@@ -820,25 +820,7 @@ export default function ReaderPage() {
     [chapters.length],
   );
 
-  const handleAcceptRemoteSync = React.useCallback(() => {
-    if (!remoteSyncBanner) return;
-    const target = remoteSyncBanner;
-    baseChapterTimeRef.current = target.durChapterTime;
-    syncedPosRef.current = {
-      chapterIndex: target.durChapterIndex,
-      paraIndex: target.durChapterPos,
-    };
-    forceNextSaveRef.current = false;
-    setRemoteSyncBanner(null);
-    jumpToPosition(target.durChapterIndex, target.durChapterPos, "start");
-    notify.success(`已同步至第 ${target.durChapterIndex + 1} 章`);
-  }, [remoteSyncBanner, jumpToPosition]);
-
-  const handleKeepLocalPosition = React.useCallback(() => {
-    forceNextSaveRef.current = true;
-    setRemoteSyncBanner(null);
-    flushProgressSave({ force: true });
-  }, [flushProgressSave]);
+  // (handleAcceptRemoteSync / handleKeepLocalPosition 已移除：远端进度现在自动跟随，不再弹确认条)
 
   React.useEffect(() => {
     const checkRemoteSync = async () => {
@@ -858,12 +840,14 @@ export default function ReaderPage() {
           remote.durChapterIndex !== snap.chapterIndex ||
           Math.abs((remote.durChapterPos ?? 0) - snap.paraIndex) >= 2;
         if (isNewerThanBase && differsInPosition) {
-          setRemoteSyncBanner({
-            durChapterIndex: remote.durChapterIndex,
-            durChapterPos: remote.durChapterPos ?? 0,
-            durChapterTitle: remote.durChapterTitle || "",
-            durChapterTime: remoteTime,
-          });
+          // 自动跟随：静默应用最新进度，不再弹“同步跳转”确认条
+          baseChapterTimeRef.current = remoteTime;
+          syncedPosRef.current = {
+            chapterIndex: remote.durChapterIndex,
+            paraIndex: remote.durChapterPos ?? 0,
+          };
+          forceNextSaveRef.current = false;
+          jumpToPosition(remote.durChapterIndex, remote.durChapterPos ?? 0, "start");
         } else if (isNewerThanBase) {
           baseChapterTimeRef.current = remoteTime;
         }
@@ -1391,45 +1375,7 @@ export default function ReaderPage() {
         />
       )}
 
-      {/* Non-blocking Cross-Device Progress Sync Pill Banner */}
-      <AnimatePresence>
-        {remoteSyncBanner ? (
-          <motion.div
-            key="remote-sync-banner"
-            role="status"
-            aria-live="polite"
-            initial={reduced ? { opacity: 0 } : { opacity: 0, y: -14, scale: 0.98 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={reduced ? { opacity: 0 } : { opacity: 0, y: -12, scale: 0.98 }}
-            transition={reduced ? { duration: 0.12 } : SPRING_POP}
-            onClick={(e) => e.stopPropagation()}
-            className="pointer-events-auto fixed inset-x-3 top-3 z-35 mx-auto flex max-w-lg items-center gap-2.5 rounded-2xl border border-line/85 bg-bg/95 px-3.5 py-2.5 shadow-[var(--shadow-lg)] backdrop-blur-xl safe-t sm:top-4 sm:rounded-full sm:px-4"
-          >
-            <span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-accent-soft text-accent">
-              <CloudDownload className="size-3.5" />
-            </span>
-            <div className="min-w-0 flex-1">
-              <p className="truncate text-xs font-medium text-ink">
-                其他设备已读至第 {remoteSyncBanner.durChapterIndex + 1} 章
-              </p>
-              {remoteSyncBanner.durChapterTitle ? (
-                <p className="truncate text-[11px] text-ink-muted">
-                  {cleanChapterTitle(remoteSyncBanner.durChapterTitle) ||
-                    remoteSyncBanner.durChapterTitle}
-                </p>
-              ) : null}
-            </div>
-            <div className="flex shrink-0 items-center gap-1.5">
-              <Button size="xs" variant="ghost" onClick={handleKeepLocalPosition}>
-                留在当前
-              </Button>
-              <Button size="xs" variant="primary" onClick={handleAcceptRemoteSync}>
-                同步跳转
-              </Button>
-            </div>
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
+      {/* (远端进度确认条已移除：现在静默自动跟随最新进度) */}
 
       {/* Subtle inline spinner overlay when refreshing an already visible chapter */}
       {loadingContent && parsed.kind !== "empty" ? (

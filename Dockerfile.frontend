@@ -1,0 +1,2 @@
+FROM reader-hehecat:restored
+COPY frontend-v2/dist /app/web-ui/dist

@@ -44,10 +44,13 @@ export function GroupManagerSheet({ open, onClose }: GroupManagerSheetProps) {
   const [savingId, setSavingId] = React.useState<number | null>(null);
   const [deletingId, setDeletingId] = React.useState<number | null>(null);
 
-  // 分组密码管理：当前在改密码的分组 + 输入框值
+  // 分组密码管理：当前在改密码的分组 + 新密码输入框值
   const [pwEditingId, setPwEditingId] = React.useState<number | null>(null);
   const [pwDraft, setPwDraft] = React.useState("");
   const [pwBusyId, setPwBusyId] = React.useState<number | null>(null);
+  // 修改/移除密码时先验证当前密码（仅当分组已有密码时需要）
+  const [pwCurrent, setPwCurrent] = React.useState("");
+  const [pwStep, setPwStep] = React.useState<"enter" | "set">("enter");
 
   React.useEffect(() => {
     if (!open) {
@@ -135,15 +138,73 @@ export function GroupManagerSheet({ open, onClose }: GroupManagerSheetProps) {
   };
 
   // 分组密码：设置/修改/移除
+  // - 未设密码 → 直接设置（step=enter）
+  // - 已有密码 → 先输入当前密码验证（step=enter, 带 current 框），再设置新密码（step=set）
+  // - 移除密码 → 先验证当前密码（step=enter, current 框），然后 setGroupPassword(id, "")
   const startPwEdit = (group: BookGroupWithCount) => {
     setPwEditingId(group.id);
     setPwDraft("");
+    setPwCurrent("");
+    // 已有密码：先进“验证当前密码”步骤；没有：直接进“设置新密码”步骤
+    setPwStep(group.hasPassword ? "enter" : "set");
   };
   const cancelPwEdit = () => {
     setPwEditingId(null);
     setPwDraft("");
+    setPwCurrent("");
+    setPwStep("enter");
   };
+
+  // 验证当前密码后进入设置步骤
+  const verifyCurrentPw = async (group: BookGroupWithCount, onVerified: () => void) => {
+    if (!pwCurrent.trim()) {
+      notify.info("请先输入当前密码");
+      return;
+    }
+    setPwBusyId(group.id);
+    try {
+      const { ok } = await booksApi.verifyGroupPassword(group.id, pwCurrent.trim());
+      if (ok) {
+        onVerified();
+      } else {
+        notify.error("当前密码不正确，请重试");
+        setPwCurrent("");
+      }
+    } catch {
+      notify.error("验证失败，请重试");
+    } finally {
+      setPwBusyId(null);
+    }
+  };
+
   const commitPw = async (group: BookGroupWithCount, clear = false) => {
+    // step=enter: 验证当前密码
+    if (pwStep === "enter") {
+      if (clear) {
+        // 移除密码：验证后直接清
+        void verifyCurrentPw(group, async () => {
+          setPwBusyId(group.id);
+          try {
+            await booksApi.setGroupPassword(group.id, "");
+            await invalidate();
+            notify.success(`已移除「${group.name}」的密码`);
+            cancelPwEdit();
+          } catch (err) {
+            notify.error(err instanceof Error ? err.message : "移除密码失败");
+          } finally {
+            setPwBusyId(null);
+          }
+        });
+      } else {
+        // 修改密码：验证后进入 set 步骤
+        void verifyCurrentPw(group, () => {
+          setPwStep("set");
+          setPwDraft("");
+        });
+      }
+      return;
+    }
+    // step=set: 设置/修改新密码
     const pwd = pwDraft.trim();
     if (!clear && pwd.length === 0) {
       notify.info("密码不能为空");
@@ -151,7 +212,6 @@ export function GroupManagerSheet({ open, onClose }: GroupManagerSheetProps) {
     }
     setPwBusyId(group.id);
     try {
-      // clear=true 或 密码为空串 → 移除加锁；否则设置/修改密码
       await booksApi.setGroupPassword(group.id, clear ? "" : pwd);
       await invalidate();
       notify.success(clear ? `已移除「${group.name}」的密码` : `已为「${group.name}」设置密码`);
@@ -370,7 +430,9 @@ export function GroupManagerSheet({ open, onClose }: GroupManagerSheetProps) {
                       <div className="mt-2.5 flex flex-col gap-2 rounded-xl border border-accent/35 bg-accent-soft/40 p-3">
                         <div className="flex items-center justify-between">
                           <p className="text-[11px] font-medium text-accent">
-                            {group.hasPassword ? "修改密码（留空并保存可移除）" : "设置访问密码"}
+                            {pwStep === "enter" && group.hasPassword
+                              ? "验证当前密码"
+                              : "设置访问密码"}
                           </p>
                           <button
                             type="button"
@@ -380,43 +442,86 @@ export function GroupManagerSheet({ open, onClose }: GroupManagerSheetProps) {
                             取消
                           </button>
                         </div>
-                        <input
-                          type="password"
-                          autoFocus
-                          value={pwDraft}
-                          onChange={(e) => setPwDraft(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") {
-                              e.preventDefault();
-                              void commitPw(group);
-                            } else if (e.key === "Escape") {
-                              e.stopPropagation();
-                              cancelPwEdit();
-                            }
-                          }}
-                          placeholder="输入密码…"
-                          className="h-8 w-full rounded-lg border border-accent/50 bg-bg px-2.5 text-[13px] text-ink outline-none ring-2 ring-accent/15"
-                        />
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            disabled={pwBusyId === group.id}
-                            onClick={() => void commitPw(group)}
-                            className="inline-flex cursor-pointer items-center gap-1 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-bg disabled:opacity-50"
-                          >
-                            {pwBusyId === group.id ? "保存中…" : "保存"}
-                          </button>
-                          {group.hasPassword ? (
-                            <button
-                              type="button"
-                              disabled={pwBusyId === group.id}
-                              onClick={() => void commitPw(group, true)}
-                              className="cursor-pointer text-[11px] text-ink-muted underline hover:text-danger disabled:opacity-50"
-                            >
-                              移除密码
-                            </button>
-                          ) : null}
-                        </div>
+
+                        {/* Step 1: 验证当前密码（仅 hasPassword 分组） */}
+                        {pwStep === "enter" && group.hasPassword ? (
+                          <>
+                            <input
+                              type="password"
+                              autoFocus
+                              value={pwCurrent}
+                              onChange={(e) => setPwCurrent(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                  e.preventDefault();
+                                  void commitPw(group);
+                                } else if (e.key === "Escape") {
+                                  e.stopPropagation();
+                                  cancelPwEdit();
+                                }
+                              }}
+                              placeholder="输入当前密码…"
+                              className="h-8 w-full rounded-lg border border-accent/50 bg-bg px-2.5 text-[13px] text-ink outline-none ring-2 ring-accent/15"
+                            />
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                disabled={pwBusyId === group.id || !pwCurrent.trim()}
+                                onClick={() => void commitPw(group)}
+                                className="inline-flex cursor-pointer items-center gap-1 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-bg disabled:opacity-50"
+                              >
+                                {pwBusyId === group.id ? "验证中…" : "验证当前密码"}
+                              </button>
+                            </div>
+                          </>
+                        ) : null}
+
+                        {/* Step 2: 设置/修改新密码 */}
+                        {pwStep === "set" ? (
+                          <>
+                            <input
+                              type="password"
+                              autoFocus
+                              value={pwDraft}
+                              onChange={(e) => setPwDraft(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                  e.preventDefault();
+                                  void commitPw(group);
+                                } else if (e.key === "Escape") {
+                                  e.stopPropagation();
+                                  cancelPwEdit();
+                                }
+                              }}
+                              placeholder={group.hasPassword ? "输入新密码…" : "输入密码…"}
+                              className="h-8 w-full rounded-lg border border-accent/50 bg-bg px-2.5 text-[13px] text-ink outline-none ring-2 ring-accent/15"
+                            />
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                disabled={pwBusyId === group.id}
+                                onClick={() => void commitPw(group)}
+                                className="inline-flex cursor-pointer items-center gap-1 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-bg disabled:opacity-50"
+                              >
+                                {pwBusyId === group.id ? "保存中…" : "保存"}
+                              </button>
+                              {group.hasPassword ? (
+                                <button
+                                  type="button"
+                                  disabled={pwBusyId === group.id}
+                                  onClick={() => {
+                                    // 移除密码需要再验证一次当前密码 → 回到 enter 步骤并标记 clear
+                                    setPwStep("enter");
+                                    setPwCurrent("");
+                                  }}
+                                  className="cursor-pointer text-[11px] text-ink-muted underline hover:text-danger disabled:opacity-50"
+                                >
+                                  移除密码
+                                </button>
+                              ) : null}
+                            </div>
+                          </>
+                        ) : null}
                       </div>
                     ) : null}
                   </motion.div>
