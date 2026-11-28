@@ -116,6 +116,7 @@ pub(crate) async fn init_schema(pool: &SqlitePool) -> Result<bool> {
             cover TEXT,
             show INTEGER DEFAULT 1,
             order_num INTEGER DEFAULT 0,
+            password TEXT,
             user_namespace TEXT DEFAULT ''
         );
         "#,
@@ -342,6 +343,11 @@ pub(crate) async fn init_schema(pool: &SqlitePool) -> Result<bool> {
 
     for stmt in STATEMENTS {
         sqlx::query(stmt).execute(pool).await?;
+    }
+    // 存量库兼容：旧 book_groups 表无 password 列时，一次性补齐（分组密码功能）。
+    // 列已存在时 ALTER 报错，静默忽略即可。
+    if let Err(e) = sqlx::query("ALTER TABLE book_groups ADD COLUMN password TEXT").execute(pool).await {
+        tracing::debug!("book_groups ADD COLUMN password（可能已存在）: {e}");
     }
     Ok(init_book_chapters_fts(pool).await)
 }

@@ -174,6 +174,8 @@ export interface BookGroupWithCount extends BookGroup {
   bookCount: number;
   groupId: number;
   groupName: string;
+  /** 该分组是否设置了密码（后端只回布尔，不回哈希） */
+  hasPassword?: boolean;
 }
 
 export interface Bookmark {

@@ -244,6 +244,14 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/deleteBookGroup", post(books::delete_book_group))
         .route("/reader3/saveBookGroupId", post(books::save_book_group_id))
         .route(
+            "/reader3/verifyGroupPassword",
+            post(books::verify_group_password),
+        )
+        .route(
+            "/reader3/setGroupPassword",
+            post(books::set_group_password),
+        )
+        .route(
             "/reader3/getBookmarks",
             get(books::get_bookmarks).post(books::get_bookmarks),
         )

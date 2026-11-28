@@ -110,14 +110,34 @@ pub async fn get_bookshelf(
     }
     match state.storage.list_books(&namespace).await {
         Ok(books) => {
-            tracing::info!("getBookshelf [{}]: {} 本", namespace, books.len());
+            // “全部”视图隐藏加锁分组里的书：book 属于任一密码分组则不出现在“全部”
+            let hidden: std::collections::HashSet<i64> = if params.get("hideLocked").map(|v| v == "1").unwrap_or(false) {
+                state
+                    .storage
+                    .locked_group_ids(&namespace)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
             let items: Vec<BookshelfItem<'_>> = books
                 .iter()
+                .filter(|book| {
+                    let gids = parse_group_ids(&book.group_ids);
+                    if hidden.is_empty() {
+                        true
+                    } else {
+                        gids.iter().all(|g| !hidden.contains(g))
+                    }
+                })
                 .map(|book| BookshelfItem {
                     book,
                     group_ids: parse_group_ids(&book.group_ids),
                 })
                 .collect();
+            tracing::info!("getBookshelf [{}]: {} 本（hideLocked 后）", namespace, items.len());
             ReturnData::ok_typed(items).into_response()
         }
         Err(e) => {

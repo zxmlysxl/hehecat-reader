@@ -50,12 +50,20 @@ pub async fn save_book_group(
         Ok(v) => v,
         Err(_) => return Json(ReturnData::err("参数错误")).into_response(),
     };
-    let group: crate::model::BookGroup = match serde_json::from_value(v.clone()) {
+    let mut group: crate::model::BookGroup = match serde_json::from_value(v.clone()) {
         Ok(g) => g,
         Err(_) => return Json(ReturnData::err("参数错误")).into_response(),
     };
     if group.name.is_empty() {
         return Json(ReturnData::err("分组名称不能为空")).into_response();
+    }
+    // 若 body 带明文 password，则哈希后存储（支持设置/清除分组密码）
+    if let Some(pw) = v.get("password").and_then(|x| x.as_str()) {
+        group.password = if pw.trim().is_empty() {
+            None
+        } else {
+            Some(crate::util::password::hash_password(pw.trim()))
+        };
     }
     if group.id > 0 && v.get("order").is_none() && v.get("orderNum").is_none() {
         return match state
@@ -140,6 +148,71 @@ pub async fn save_book_group_id(
         Err(e) => {
             tracing::error!("saveBookGroupId 失败: {e}");
             Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST `/reader3/verifyGroupPassword`：校验分组密码（JSON: groupId + password）
+pub async fn verify_group_password(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let id = int_param_of(&params, body_json.as_ref(), &["groupId", "id"]).unwrap_or(-1);
+    let password = str_param_of(&params, body_json.as_ref(), &["password"]);
+    if id <= 0 || password.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.get_book_group_password(&namespace, id).await {
+        Ok(Some(hash)) => {
+            let ok = crate::util::password::verify_argon2id(&password, &hash);
+            Json(ReturnData::ok(json!({ "ok": ok })))
+        }
+        Ok(None) => Json(ReturnData::err("该分组未设置密码")),
+        Err(e) => {
+            tracing::error!("verifyGroupPassword [{id}] 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// POST `/reader3/setGroupPassword`：设置/清除分组密码（JSON: groupId + password(空串=清除)）
+pub async fn set_group_password(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let id = int_param_of(&params, body_json.as_ref(), &["groupId", "id"]).unwrap_or(-1);
+    let raw = str_param_of(&params, body_json.as_ref(), &["password"]);
+    if id <= 0 {
+        return Json(ReturnData::err("参数错误"));
+    }
+    let stored: Option<String> = if raw.is_empty() {
+        None // 空 = 清除加锁
+    } else {
+        Some(crate::util::password::hash_password(&raw))
+    };
+    match state
+        .storage
+        .set_book_group_password(&namespace, id, stored.as_deref())
+        .await
+    {
+        Ok(_) => Json(ReturnData::ok(json!({ "locked": stored.is_some() }))),
+        Err(e) => {
+            tracing::error!("setGroupPassword [{id}] 失败: {e}");
+            Json(ReturnData::err(e.to_string()))
         }
     }
 }

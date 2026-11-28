@@ -1389,25 +1389,27 @@ impl Storage {
                 }
             }
             sqlx::query(
-                "INSERT OR REPLACE INTO book_groups (id, name, cover, show, order_num, user_namespace) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT OR REPLACE INTO book_groups (id, name, cover, show, order_num, password, user_namespace) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
             .bind(g.id)
             .bind(&g.name)
             .bind(&g.cover)
             .bind(g.show)
             .bind(g.order)
+            .bind(&g.password)
             .bind(ns)
             .execute(&self.pool)
             .await?;
         } else {
             let r = sqlx::query(
-                "INSERT INTO book_groups (name, cover, show, order_num, user_namespace) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO book_groups (name, cover, show, order_num, password, user_namespace) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .bind(&g.name)
             .bind(&g.cover)
             .bind(g.show)
             .bind(g.order)
+            .bind(&g.password)
             .bind(ns)
             .execute(&self.pool)
             .await?;
@@ -1503,8 +1505,8 @@ impl Storage {
         &self,
         ns: &str,
     ) -> Result<Vec<crate::model::BookGroupWithCount>> {
-        let mut rows = sqlx::query_as::<_, (i64, String, Option<String>, bool, i64, i64)>(
-            "SELECT g.id, g.name, g.cover, g.show, g.order_num, 0 FROM book_groups g WHERE g.user_namespace = ?1 ORDER BY g.order_num, g.id",
+        let mut rows = sqlx::query_as::<_, (i64, String, Option<String>, bool, i64, i64, Option<String>)>(
+            "SELECT g.id, g.name, g.cover, g.show, g.order_num, 0, g.password FROM book_groups g WHERE g.user_namespace = ?1 ORDER BY g.order_num, g.id",
         )
         .bind(ns)
         .fetch_all(&self.pool)
@@ -1529,15 +1531,16 @@ impl Storage {
                 .execute(&self.pool)
                 .await;
             }
-            rows = sqlx::query_as::<_, (i64, String, Option<String>, bool, i64, i64)>(
-                "SELECT g.id, g.name, g.cover, g.show, g.order_num, 0 FROM book_groups g WHERE g.user_namespace = ?1 ORDER BY g.order_num, g.id",
+            rows = sqlx::query_as::<_, (i64, String, Option<String>, bool, i64, i64, Option<String>)>(
+                "SELECT g.id, g.name, g.cover, g.show, g.order_num, 0, g.password FROM book_groups g WHERE g.user_namespace = ?1 ORDER BY g.order_num, g.id",
             )
             .bind(ns)
             .fetch_all(&self.pool)
             .await?;
         }
         let mut out = Vec::with_capacity(rows.len());
-        for (id, name, cover, show, order, _) in rows {
+        for (id, name, cover, show, order, _, password) in rows {
+            let has_password = password.as_deref().map(|p| !p.trim().is_empty()).unwrap_or(false);
             let pattern = format!("%\"{id}\"%");
             let count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM books WHERE user_namespace = ?1 AND (group_name = ?2 OR group_ids LIKE ?3)",
@@ -1558,9 +1561,67 @@ impl Storage {
                 order,
                 order_num: order,
                 book_count: count,
+                has_password,
             });
         }
         Ok(out)
+    }
+
+    /// 读取分组密码哈希（None = 未加锁）
+    pub async fn get_book_group_password(&self, ns: &str, id: i64) -> Result<Option<String>> {
+        let owned: Option<String> =
+            sqlx::query_scalar("SELECT user_namespace FROM book_groups WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        match owned {
+            Some(owner) if owner == ns => {
+                let p: Option<String> =
+                    sqlx::query_scalar("SELECT password FROM book_groups WHERE id = ?1 AND user_namespace = ?2")
+                        .bind(id)
+                        .bind(ns)
+                        .fetch_optional(&self.pool)
+                        .await?;
+                Ok(p.filter(|s| !s.trim().is_empty()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// 设置/清除分组密码哈希（None = 清除加锁）
+    pub async fn set_book_group_password(
+        &self,
+        ns: &str,
+        id: i64,
+        password: Option<&str>,
+    ) -> Result<u64> {
+        let owned: Option<String> =
+            sqlx::query_scalar("SELECT user_namespace FROM book_groups WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        if owned.as_deref() != Some(ns) {
+            anyhow::bail!("分组不存在或无权操作");
+        }
+        let r = sqlx::query("UPDATE book_groups SET password = ?3 WHERE user_namespace = ?1 AND id = ?2")
+            .bind(ns)
+            .bind(id)
+            .bind(password)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 加锁分组 id 集合（password 非空），供“全部”视图过滤用
+    pub async fn locked_group_ids(&self, ns: &str) -> Result<Vec<i64>> {
+        let rows: Vec<i64> =
+            sqlx::query_scalar(
+                "SELECT id FROM book_groups WHERE user_namespace = ?1 AND password IS NOT NULL AND TRIM(password) <> ''",
+            )
+            .bind(ns)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
     }
 
     pub async fn rename_book_group(&self, ns: &str, id: i64, name: &str) -> Result<u64> {

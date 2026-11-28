@@ -8,6 +8,7 @@ import {
   CheckSquare,
   Compass,
   Download,
+  Lock,
   Ellipsis,
   FileUp,
   Folder,
@@ -30,6 +31,7 @@ import type { Book, BookGroupWithCount } from "@/api/types";
 import { BookInspectorSheet } from "@/features/book/BookInspectorSheet";
 import { ImportBookSheet } from "@/features/book/ImportBookSheet";
 import { GroupManagerSheet } from "@/features/library/GroupManagerSheet";
+import { GroupPasswordSheet } from "@/features/library/GroupPasswordSheet";
 import { cn } from "@/lib/cn";
 import { buildReaderUrl, cleanChapterTitle, cleanIntro, formatRelativeTime } from "@/lib/format";
 import { requestKeepScreenAwakeNow } from "@/lib/keepScreenAwake";
@@ -168,6 +170,43 @@ export default function LibraryPage() {
 
   // 过滤掉后端负数系统伪分组，避免与“全部 / 未分组”重复
   const groups = React.useMemo(() => rawGroups.filter((g) => g.id > 0), [rawGroups]);
+
+  /* 分组密码：session 级解锁缓存（仅本次会话有效，刷新后需重新输） */
+  const [unlockedGroups, setUnlockedGroups] = React.useState<Set<number>>(() => new Set());
+  // 正在请求解锁的分组（null = 不弹密码框）
+  const [pwGroup, setPwGroup] = React.useState<BookGroupWithCount | null>(null);
+
+  // 仍上锁的分组 id 集合（hasPassword 且未解锁）
+  const lockedIds = React.useMemo(() => {
+    const s = new Set<number>();
+    for (const g of groups) {
+      if (g.hasPassword && !unlockedGroups.has(g.id)) s.add(g.id);
+    }
+    return s;
+  }, [groups, unlockedGroups]);
+
+  // 判断书是否落入任一仍上锁的分组（“全部”视图下用于隐藏）
+  const bookInLockedGroup = React.useCallback(
+    (b: Book): boolean => {
+      if (lockedIds.size === 0) return false;
+      const ids =
+        b.groupIds && b.groupIds.length > 0 ? b.groupIds : b.group > 0 ? [b.group] : [];
+      return ids.some((id) => lockedIds.has(id));
+    },
+    [lockedIds],
+  );
+
+  // 点击分组：有密码且未解锁 → 弹密码框；否则直接选中
+  const handleGroupClick = React.useCallback(
+    (g: BookGroupWithCount) => {
+      if (g.hasPassword && !unlockedGroups.has(g.id)) {
+        setPwGroup(g);
+      } else {
+        setActiveGroup(g.id);
+      }
+    },
+    [unlockedGroups],
+  );
 
   /* ---------------- UI State ---------------- */
   const [activeGroup, setActiveGroup] = React.useState<GroupFilter>("all");
@@ -326,6 +365,8 @@ export default function LibraryPage() {
     const q = trimmedQuery.toLowerCase();
     const filtered = shelf.filter((b) => {
       if (!isBookInGroup(b, activeGroup)) return false;
+      // “全部”视图隐藏落入上锁分组的书（避免泄露密码分组里的书）
+      if (activeGroup === "all" && bookInLockedGroup(b)) return false;
       if (!q) return true;
       return (
         b.name.toLowerCase().includes(q) ||
@@ -346,7 +387,13 @@ export default function LibraryPage() {
       }
       return (b.durChapterTime || b.createdAt || 0) - (a.durChapterTime || a.createdAt || 0);
     });
-  }, [shelf, activeGroup, trimmedQuery, sortBy]);
+  }, [shelf, activeGroup, trimmedQuery, sortBy, bookInLockedGroup]);
+
+  // “全部”标签的可见书数（已过滤未解锁分组内的书）
+  const allVisibleCount = React.useMemo(
+    () => shelf.reduce((n, b) => (bookInLockedGroup(b) ? n : n + 1), 0),
+    [shelf, bookInLockedGroup],
+  );
 
   const showHero =
     !shelfLoading &&
@@ -751,7 +798,7 @@ export default function LibraryPage() {
           <GroupPill
             active={activeGroup === "all"}
             label="全部"
-            count={shelf.length}
+            count={allVisibleCount}
             onClick={() => setActiveGroup("all")}
           />
           {groups.map((g) => (
@@ -760,7 +807,8 @@ export default function LibraryPage() {
               active={activeGroup === g.id}
               label={g.name}
               count={g.bookCount}
-              onClick={() => setActiveGroup(g.id)}
+              locked={Boolean(g.hasPassword) && !unlockedGroups.has(g.id)}
+              onClick={() => handleGroupClick(g)}
             />
           ))}
           {groups.length > 0 && ungroupedCount > 0 ? (
@@ -1082,6 +1130,20 @@ export default function LibraryPage() {
         open={groupSheetOpen}
         onClose={() => setGroupSheetOpen(false)}
       />
+      <GroupPasswordSheet
+        open={Boolean(pwGroup)}
+        group={pwGroup}
+        onClose={() => setPwGroup(null)}
+        onVerified={(id) => {
+          setUnlockedGroups((prev) => {
+            const next = new Set(prev);
+            next.add(id);
+            return next;
+          });
+          setActiveGroup(id);
+          setPwGroup(null);
+        }}
+      />
     </PageEnter>
   );
 }
@@ -1370,11 +1432,13 @@ function GroupPill({
   label,
   count,
   onClick,
+  locked,
 }: {
   active: boolean;
   label: string;
   count: number;
   onClick: () => void;
+  locked?: boolean;
 }) {
   const reduced = useReducedMotion();
   return (
@@ -1395,6 +1459,7 @@ function GroupPill({
           className="pointer-events-none absolute inset-x-0 bottom-0 h-[2px] rounded-full bg-accent md:inset-0 md:-z-10 md:h-auto md:rounded-full md:border md:border-accent/35 md:bg-accent-soft"
         />
       ) : null}
+      {locked ? <Lock className="size-3 shrink-0 text-ink-muted" /> : null}
       <span>{label}</span>
       <span className={cn("text-[11px] tabular-nums", active ? "text-accent/85" : "opacity-70")}>
         {count}

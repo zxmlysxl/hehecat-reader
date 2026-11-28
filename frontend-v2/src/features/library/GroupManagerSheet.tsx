@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Folder, FolderPlus, Pencil, Plus, Sparkles, Trash2, X } from "lucide-react";
+import { Check, Folder, FolderPlus, KeyRound, Pencil, Plus, Sparkles, Trash2, X } from "lucide-react";
 import * as React from "react";
 import { booksApi } from "@/api/endpoints";
 import type { BookGroupWithCount } from "@/api/types";
@@ -43,6 +43,11 @@ export function GroupManagerSheet({ open, onClose }: GroupManagerSheetProps) {
   const [editDraft, setEditDraft] = React.useState("");
   const [savingId, setSavingId] = React.useState<number | null>(null);
   const [deletingId, setDeletingId] = React.useState<number | null>(null);
+
+  // 分组密码管理：当前在改密码的分组 + 输入框值
+  const [pwEditingId, setPwEditingId] = React.useState<number | null>(null);
+  const [pwDraft, setPwDraft] = React.useState("");
+  const [pwBusyId, setPwBusyId] = React.useState<number | null>(null);
 
   React.useEffect(() => {
     if (!open) {
@@ -126,6 +131,35 @@ export function GroupManagerSheet({ open, onClose }: GroupManagerSheetProps) {
       notify.error(err instanceof Error ? err.message : "删除分组失败");
     } finally {
       setDeletingId(null);
+    }
+  };
+
+  // 分组密码：设置/修改/移除
+  const startPwEdit = (group: BookGroupWithCount) => {
+    setPwEditingId(group.id);
+    setPwDraft("");
+  };
+  const cancelPwEdit = () => {
+    setPwEditingId(null);
+    setPwDraft("");
+  };
+  const commitPw = async (group: BookGroupWithCount, clear = false) => {
+    const pwd = pwDraft.trim();
+    if (!clear && pwd.length === 0) {
+      notify.info("密码不能为空");
+      return;
+    }
+    setPwBusyId(group.id);
+    try {
+      // clear=true 或 密码为空串 → 移除加锁；否则设置/修改密码
+      await booksApi.setGroupPassword(group.id, clear ? "" : pwd);
+      await invalidate();
+      notify.success(clear ? `已移除「${group.name}」的密码` : `已为「${group.name}」设置密码`);
+      cancelPwEdit();
+    } catch (err) {
+      notify.error(err instanceof Error ? err.message : "设置密码失败");
+    } finally {
+      setPwBusyId(null);
     }
   };
 
@@ -286,9 +320,24 @@ export function GroupManagerSheet({ open, onClose }: GroupManagerSheetProps) {
                             {group.name}
                           </span>
                           <Badge className="shrink-0">{group.bookCount} 本</Badge>
+                          {group.hasPassword ? (
+                            <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-accent/30 bg-accent-soft px-1.5 py-0.5 text-[10px] font-medium text-accent">
+                              <KeyRound className="size-2.5" />
+                              已加锁
+                            </span>
+                          ) : null}
                         </button>
 
                         <div className="flex shrink-0 items-center gap-0.5">
+                          <IconButton
+                            size="sm"
+                            tone={group.hasPassword ? "accent" : undefined}
+                            aria-label={group.hasPassword ? `移除 ${group.name} 的密码` : `为 ${group.name} 设置密码`}
+                            onClick={() => startPwEdit(group)}
+                            className="opacity-70 transition-opacity group-hover:opacity-100"
+                          >
+                            <KeyRound className="size-3.5" />
+                          </IconButton>
                           <IconButton
                             size="sm"
                             aria-label={`重命名 ${group.name}`}
@@ -316,6 +365,60 @@ export function GroupManagerSheet({ open, onClose }: GroupManagerSheetProps) {
                         </div>
                       </div>
                     )}
+
+                    {pwEditingId === group.id ? (
+                      <div className="mt-2.5 flex flex-col gap-2 rounded-xl border border-accent/35 bg-accent-soft/40 p-3">
+                        <div className="flex items-center justify-between">
+                          <p className="text-[11px] font-medium text-accent">
+                            {group.hasPassword ? "修改密码（留空并保存可移除）" : "设置访问密码"}
+                          </p>
+                          <button
+                            type="button"
+                            className="text-[11px] text-ink-muted hover:text-ink"
+                            onClick={cancelPwEdit}
+                          >
+                            取消
+                          </button>
+                        </div>
+                        <input
+                          type="password"
+                          autoFocus
+                          value={pwDraft}
+                          onChange={(e) => setPwDraft(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              void commitPw(group);
+                            } else if (e.key === "Escape") {
+                              e.stopPropagation();
+                              cancelPwEdit();
+                            }
+                          }}
+                          placeholder="输入密码…"
+                          className="h-8 w-full rounded-lg border border-accent/50 bg-bg px-2.5 text-[13px] text-ink outline-none ring-2 ring-accent/15"
+                        />
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={pwBusyId === group.id}
+                            onClick={() => void commitPw(group)}
+                            className="inline-flex cursor-pointer items-center gap-1 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-bg disabled:opacity-50"
+                          >
+                            {pwBusyId === group.id ? "保存中…" : "保存"}
+                          </button>
+                          {group.hasPassword ? (
+                            <button
+                              type="button"
+                              disabled={pwBusyId === group.id}
+                              onClick={() => void commitPw(group, true)}
+                              className="cursor-pointer text-[11px] text-ink-muted underline hover:text-danger disabled:opacity-50"
+                            >
+                              移除密码
+                            </button>
+                          ) : null}
+                        </div>
+                      </div>
+                    ) : null}
                   </motion.div>
                 );
               })}

@@ -21,6 +21,9 @@ pub struct BookGroup {
     /// 排序（order 为 SQLite 关键字 → 列名 order_num）
     #[sqlx(rename = "order_num")]
     pub order: i64,
+    /// 分组密码哈希（argon2id PHC；None/空 = 未加锁）
+    #[sqlx(default)]
+    pub password: Option<String>,
     /// 命名空间（secure 模式用户名 / default）
     #[serde(skip)]
     #[sqlx(rename = "user_namespace")]
@@ -35,6 +38,7 @@ impl Default for BookGroup {
             cover: None,
             show: true,
             order: 0,
+            password: None,
             user_namespace: String::new(),
         }
     }
@@ -63,6 +67,9 @@ pub struct BookGroupWithCount {
     /// 组内书数
     #[serde(rename = "bookCount")]
     pub book_count: i64,
+    /// 是否设置了分组密码（列表端点只暴露布尔，不暴露哈希）
+    #[serde(rename = "hasPassword")]
+    pub has_password: bool,
     /// legacy 字段别名（YueduApi getBookGroups 旧客户端按 groupId/groupName 解析）
     #[serde(rename = "groupId")]
     pub group_id: i64,

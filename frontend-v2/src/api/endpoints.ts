@@ -140,8 +140,11 @@ export interface SaveBookProgressResult {
 }
 
 export const booksApi = {
-  getShelf: (refresh = false) =>
-    apiGet<Book[]>("/reader3/getBookshelf", refresh ? { refresh: 1 } : undefined),
+  getShelf: (refresh = false, opts?: { hideLocked?: boolean }) =>
+    apiGet<Book[]>("/reader3/getBookshelf", {
+      ...(refresh ? { refresh: 1 } : {}),
+      ...(opts?.hideLocked ? { hideLocked: 1 } : {}),
+    }),
   saveBook: (book: Partial<Book> & { bookUrl: string }) =>
     apiPost<null>("/reader3/saveBook", book),
   deleteBook: (bookUrl: string) => apiPost<string>("/reader3/deleteBook", { bookUrl }),
@@ -203,11 +206,17 @@ export const booksApi = {
 
   // Groups
   getGroups: () => apiGet<BookGroupWithCount[]>("/reader3/getBookGroups"),
-  saveGroup: (group: Partial<BookGroup> & { name: string }) =>
-    apiPost<BookGroup>("/reader3/saveBookGroup", group),
+  saveGroup: (group: Partial<BookGroup> & { name: string; password?: string | null }) =>
+    apiPost<BookGroup>("/reader3/saveBookGroup", group as unknown as Record<string, unknown>),
   deleteGroup: (id: number) => apiPost<string>("/reader3/deleteBookGroup", { id }),
   setBookGroup: (bookUrl: string, groupId: number) =>
     apiPost<null>("/reader3/saveBookGroupId", { bookUrl, groupId }),
+  /** 设置/清除分组密码（password 空串 = 清除加锁） */
+  setGroupPassword: (groupId: number, password: string) =>
+    apiPost<{ locked: boolean }>("/reader3/setGroupPassword", { groupId, password }),
+  /** 校验分组密码 */
+  verifyGroupPassword: (groupId: number, password: string) =>
+    apiPost<{ ok: boolean }>("/reader3/verifyGroupPassword", { groupId, password }),
 
   // Bookmarks
   getBookmarks: (bookUrl: string) =>

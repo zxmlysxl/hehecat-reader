@@ -11,6 +11,7 @@ mod tests;
 pub use chapter::{get_book_content, get_chapter_list, get_chapter_list_by_rule};
 pub use groups_bookmarks::{
     delete_book_group, delete_bookmark, delete_bookmarks, get_book_groups, get_bookmarks,
+    set_group_password, verify_group_password,
     save_book_group, save_book_group_id, save_bookmark,
 };
 pub(crate) use helpers::{resolve_loc_book_file, resolve_local_file_path, txt_toc_rule_regexes};
