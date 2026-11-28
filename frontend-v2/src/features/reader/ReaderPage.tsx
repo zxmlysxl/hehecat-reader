@@ -352,6 +352,10 @@ export default function ReaderPage() {
 
   // Core reading state
   const [chapters, setChapters] = React.useState<BookChapter[]>([]);
+  // 章节列表的 ref 镜像：jumpToPosition 会被闭包捕获（useCallback 依赖不更新），
+  // 直接读 chapters 会拿到首帧的空数组 -> 目标章节被夹到 0 -> 进度跳回第一章
+  const chaptersRef = React.useRef<BookChapter[]>([]);
+  chaptersRef.current = chapters;
   const [loadingChapters, setLoadingChapters] = React.useState(false);
   const [chapterIndex, setChapterIndex] = React.useState<number>(
     () => parsedUrlIndex ?? shelfBook?.durChapterIndex ?? 0,
@@ -408,6 +412,8 @@ export default function ReaderPage() {
     if (!bookUrl) return;
     if (resolvedBookRef.current === bookUrl) return;
     if (parsedUrlIndex === null && !shelfFetched) return;
+    // 书架数据还没拿到（接口失败 / 登录态过期）时不要把进度重置成第 1 章，等书架到达再解析
+    if (parsedUrlIndex === null && !shelfBook) return;
 
     resolvedBookRef.current = bookUrl;
     const initIdx = parsedUrlIndex ?? shelfBook?.durChapterIndex ?? 0;
@@ -451,6 +457,13 @@ export default function ReaderPage() {
       shelfBook.durChapterIndex !== snap.chapterIndex ||
       Math.abs((shelfBook.durChapterPos ?? 0) - snap.paraIndex) >= 2;
     if (differs) {
+      // 目录未加载完成时不跳转，避免目标章节被夹到第 1 章
+      if (chaptersRef.current.length === 0) return;
+      // 只跟随更靠后的进度，避免进度倒退
+      if (shelfBook.durChapterIndex < snap.chapterIndex) {
+        baseChapterTimeRef.current = remoteTime;
+        return;
+      }
       // 自动跟随：静默应用最新进度，不打断阅读
       const syncIdx = shelfBook.durChapterIndex;
       const syncPos = shelfBook.durChapterPos ?? 0;
@@ -751,12 +764,15 @@ export default function ReaderPage() {
             // 自动跟随远端进度，不再弹确认条
             const r = res.remote;
             baseChapterTimeRef.current = r.durChapterTime ?? Date.now();
-            syncedPosRef.current = {
-              chapterIndex: r.durChapterIndex,
-              paraIndex: r.durChapterPos ?? 0,
-            };
-            forceNextSaveRef.current = false;
-            jumpToPosition(r.durChapterIndex, r.durChapterPos ?? 0, "start");
+            // 远端进度更靠前时不倒退（避免用户被拽回上一章 / 第一章）
+            if (r.durChapterIndex >= sentChapter && chaptersRef.current.length > 0) {
+              syncedPosRef.current = {
+                chapterIndex: r.durChapterIndex,
+                paraIndex: r.durChapterPos ?? 0,
+              };
+              forceNextSaveRef.current = false;
+              jumpToPosition(r.durChapterIndex, r.durChapterPos ?? 0, "start");
+            }
             return;
           }
           const serverTime = res?.durChapterTime ?? Date.now();
@@ -808,7 +824,10 @@ export default function ReaderPage() {
   // Flush on unmount & detect cross-device progress when returning to foreground
   const jumpToPosition = React.useCallback(
     (targetChapter: number, targetPara = 0, align: "start" | "end" = "start") => {
-      const clamped = Math.min(Math.max(0, chapters.length - 1), Math.max(0, targetChapter));
+      const listLen = chaptersRef.current.length;
+      // 目录尚未加载时不能把目标章节夹到 0，否则会直接跳回第一章
+      const maxIdx = listLen > 0 ? listLen - 1 : Number.MAX_SAFE_INTEGER;
+      const clamped = Math.min(Math.max(0, maxIdx), Math.max(0, targetChapter));
       setChapterIndex(clamped);
       setJumpSignal((prev) => ({
         paraIndex: Math.max(0, targetPara),
@@ -817,7 +836,7 @@ export default function ReaderPage() {
       }));
       setTtsParaIndex(Math.max(0, targetPara));
     },
-    [chapters.length],
+    [],
   );
 
   // (handleAcceptRemoteSync / handleKeepLocalPosition 已移除：远端进度现在自动跟随，不再弹确认条)
@@ -840,6 +859,13 @@ export default function ReaderPage() {
           remote.durChapterIndex !== snap.chapterIndex ||
           Math.abs((remote.durChapterPos ?? 0) - snap.paraIndex) >= 2;
         if (isNewerThanBase && differsInPosition) {
+          // 目录未加载完成时不跳转，避免目标章节被夹到第 1 章
+          if (chaptersRef.current.length === 0) return;
+          // 只跟随更靠后的远端进度，绝不自动倒退（倒退等于把用户拽回开头）
+          if (remote.durChapterIndex < snap.chapterIndex) {
+            baseChapterTimeRef.current = remoteTime;
+            return;
+          }
           // 自动跟随：静默应用最新进度，不再弹“同步跳转”确认条
           baseChapterTimeRef.current = remoteTime;
           syncedPosRef.current = {
