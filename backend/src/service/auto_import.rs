@@ -24,7 +24,7 @@ pub const DEFAULT_LIST_URL: &str = "https://www.yckceo.com/yuedu/shuyuans/index.
 const MAX_LIST_PAGES: usize = 5;
 
 /// 单次最多导入的合集条目数（防止一次性灌入过多）
-const MAX_IMPORT_PER_RUN: usize = 20;
+const MAX_IMPORT_PER_RUN: usize = 10_000; // 允许导多少导多少，只设上限防止无限增长
 
 /// 合集详情页 → json 订阅地址
 /// 兼容两种格式：
