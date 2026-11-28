@@ -118,7 +118,7 @@ export const autoImportApi = {
     listUrl?: string;
   }) => apiPost<AutoImportConfig>("/reader3/autoImportConfig", body),
   run: (forceFullScan = false) =>
-    apiPost<AutoImportRunResult>("/reader3/autoImportRun", { forceFullScan }, { timeoutMs: 120_000 }),
+    apiPost<AutoImportRunResult>("/reader3/autoImportRun", { forceFullScan }, { timeoutMs: 600_000 }),
 };
 
 /* ---------- Bookshelf, Reading, Groups, Bookmarks & Local Import ---------- */
